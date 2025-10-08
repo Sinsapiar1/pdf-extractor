@@ -200,6 +200,83 @@ class CamelotExtractorPro:
         except:
             return row_data
 
+    def fix_multiline_first_column(self, row_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        CRÍTICO: Detecta cuando col 0 tiene múltiples valores con saltos de línea
+        Patrón: "FL\n612d\n729000018873" → debe separarse en cols 0, 1, 2
+        
+        VALIDACIÓN UNIVERSAL por LONGITUD:
+        - Slip number: 12 dígitos (7290000XXXXX)
+        - Warehouse: <= 10 caracteres (puede ser solo números o alfanumérico)
+        """
+        try:
+            if len(row_data.columns) < 3:
+                return row_data
+            
+            first_cell = str(row_data.iloc[0, 0]).strip()
+            
+            # Detectar si tiene saltos de línea Y contiene slip number
+            if '\n' in first_cell and re.search(r'7290000\d{5}', first_cell):
+                st.warning("⚠️ Multiline first column detected - separando valores...")
+                
+                # Separar por saltos de línea
+                lines = [line.strip() for line in first_cell.split('\n') if line.strip()]
+                
+                # Extraer valores específicos
+                fl_value = 'FL'  # Default
+                wh_value = ''
+                slip_value = ''
+                
+                for line in lines:
+                    # 1. Buscar estado (FL, DL, TX, etc.)
+                    if line in ['FL', 'DL', 'TX', 'CA', 'NY', 'GA', 'NC', 'SC', 'VA']:
+                        fl_value = line
+                        continue
+                    
+                    # 2. Buscar slip number (SIEMPRE 12 dígitos)
+                    slip_match = re.match(r'^(7290000\d{5})$', line)
+                    if slip_match:
+                        slip_value = slip_match.group(1)
+                        continue
+                    
+                    # 3. Buscar warehouse (NO es slip Y tiene <= 10 caracteres)
+                    if len(line) <= 10:
+                        # Verificar que sea alfanumérico o tenga formato RO-XX
+                        if re.match(r'^(RO-[A-Z]{2}|[\dA-Za-z]+)$', line, re.IGNORECASE):
+                            wh_value = line.upper()
+                            continue
+                
+                # Solo proceder si encontramos slip number
+                if slip_value:
+                    st.info(f"Separando: '{fl_value}' | '{wh_value}' | '{slip_value}'")
+                    
+                    # Guardar TODOS los valores desde col 1 hasta col 17
+                    saved_values = []
+                    for col_idx in range(1, min(18, len(row_data.columns))):
+                        saved_values.append(str(row_data.iloc[0, col_idx]))
+                    
+                    # Reconstruir fila correctamente
+                    row_data.iloc[0, 0] = fl_value
+                    row_data.iloc[0, 1] = wh_value if wh_value else '612D'  # Default si no encuentra
+                    row_data.iloc[0, 2] = slip_value
+                    
+                    # Desplazar todos los valores guardados hacia la derecha
+                    for i, val in enumerate(saved_values):
+                        new_col = 3 + i
+                        if new_col < len(row_data.columns):
+                            row_data.iloc[0, new_col] = val
+                    
+                    st.success(f"✅ Fila reconstruida: {fl_value} | {wh_value} | {slip_value}")
+            
+            return row_data
+        
+        except Exception as e:
+            st.error(f"Error en fix_multiline_first_column: {e}")
+            import traceback
+            st.error(traceback.format_exc())
+            return row_data
+    
+    
     def clean_warehouse_slip_column(self, row_data: pd.DataFrame) -> pd.DataFrame:
         """Separa warehouse code y slip number"""
         try:
@@ -434,6 +511,7 @@ class CamelotExtractorPro:
                                 row_data = df.iloc[idx:idx+1].copy()
 
                                 row_data = self.ensure_18_columns(row_data)
+                                row_data = self.fix_multiline_first_column(row_data)              
                                 row_data = self.clean_warehouse_slip_column(row_data)
                                 row_data = self.fix_customer_definitive_split(row_data)
                                 row_data = self.fix_column_shift_after_definitive(row_data)
