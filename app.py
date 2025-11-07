@@ -58,9 +58,9 @@ class CamelotExtractorPro:
 
     def __init__(self):
         self.extraction_methods = [
-            self.method_lattice_standard,
-            self.method_stream_balanced,
-            self.method_stream_standard,
+            self.method_stream_standard,       # PRIORIDAD 1: Funciona mejor con tablillas cerradas
+            self.method_stream_balanced,       # PRIORIDAD 2
+            self.method_lattice_standard,      # PRIORIDAD 3
             self.method_stream_aggressive,
             self.method_lattice_detailed,
             self.method_hybrid
@@ -131,7 +131,6 @@ class CamelotExtractorPro:
                                     numbers_str = ', '.join(found_numbers)
                                     row.iloc[0, 12] = current_tablets + ' ' + numbers_str
                                     continuation_found = True
-                                    st.success(f"✅ Tablets continuación: {numbers_str}")
 
                     # CASO 2: OPEN (col 14)
                     if len(row.columns) > 14:
@@ -148,7 +147,6 @@ class CamelotExtractorPro:
                                     codes_str = ', '.join(found_codes)
                                     row.iloc[0, 14] = current_open + ' ' + codes_str
                                     continuation_found = True
-                                    st.success(f"✅ Open continuación: {codes_str}")
 
                     if continuation_found:
                         skip_next = True
@@ -215,9 +213,6 @@ class CamelotExtractorPro:
                 
                 # Si col 14 NO tiene códigos [MALT] Y parece ser un número simple
                 if not has_malt_codes and is_simple_number:
-                    st.warning(f"⚠️ Detectado desplazamiento: Col 14 = '{col_14}' (sin códigos [MALT])")
-                    st.info("🔧 Insertando columna Open vacía y desplazando columnas...")
-                    
                     # Guardar valores desde col 14 hasta col 17
                     saved_values = []
                     for col_idx in range(14, min(18, len(row_data.columns))):
@@ -231,18 +226,14 @@ class CamelotExtractorPro:
                         new_col = 15 + i
                         if new_col < len(row_data.columns):
                             row_data.iloc[0, new_col] = val
-                    
-                    st.success(f"✅ Open vacía insertada. Tablets_Total = {saved_values[0] if saved_values else 'N/A'}")
                 
                 # Caso adicional: Si col 14 tiene un número pequeño sin [MALT], limpiarlo
                 elif col_14 and not has_malt_codes:
                     if col_14.isdigit() and int(col_14) <= 5:
-                        st.info(f"🧹 Limpiando basura en Open: '{col_14}'")
                         row_data.iloc[0, 14] = ''
 
             return row_data
         except Exception as e:
-            st.error(f"Error en fix_missing_open_column: {e}")
             return row_data
 
     def clean_open_tablets_when_closed(self, row_data: pd.DataFrame) -> pd.DataFrame:
@@ -293,8 +284,6 @@ class CamelotExtractorPro:
             
             # Detectar si tiene saltos de línea Y contiene slip number
             if '\n' in first_cell and re.search(r'7290000\d{5}', first_cell):
-                st.warning("⚠️ Multiline first column detected - separando valores...")
-                
                 # Separar por saltos de línea
                 lines = [line.strip() for line in first_cell.split('\n') if line.strip()]
                 
@@ -324,8 +313,6 @@ class CamelotExtractorPro:
                 
                 # Solo proceder si encontramos slip number
                 if slip_value:
-                    st.info(f"Separando: '{fl_value}' | '{wh_value}' | '{slip_value}'")
-                    
                     # Guardar TODOS los valores desde col 1 hasta col 17
                     saved_values = []
                     for col_idx in range(1, min(18, len(row_data.columns))):
@@ -341,8 +328,6 @@ class CamelotExtractorPro:
                         new_col = 3 + i
                         if new_col < len(row_data.columns):
                             row_data.iloc[0, new_col] = val
-                    
-                    st.success(f"✅ Fila reconstruida: {fl_value} | {wh_value} | {slip_value}")
             
             return row_data
         
