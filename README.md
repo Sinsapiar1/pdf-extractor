@@ -1,10 +1,31 @@
-# 📄 Camelot PDF Extractor Pro v3.0
+# 📄 Camelot PDF Extractor Pro v3.1
 
 Extractor profesional de PDFs con Camelot - Sistema completo de análisis de albaranes y tablillas
 
-![Version](https://img.shields.io/badge/version-3.0-blue.svg)
+![Version](https://img.shields.io/badge/version-3.1-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 ![Status](https://img.shields.io/badge/status-production-green.svg)
+
+## 🆕 Nueva Actualización v3.1 - Corrección Crítica para Cierre de Mes
+
+### ✅ Problema Solucionado: Columna "Open Tablets" Vacía
+
+**¿Qué pasaba antes?**
+- En el último día de cierre de mes, cuando **todas las tablillas están cerradas**, la columna "Open Tablets" queda completamente vacía en el PDF
+- Camelot **no detecta columnas vacías**, causando que todas las columnas posteriores se desplacen una posición a la izquierda
+- Esto provocaba que los datos se extrajeran incorrectamente: `Tablets_Total` aparecía en la posición de `Open`, causando confusión en los reportes
+
+**¿Qué hace ahora la v3.1?**
+- ✅ **Detecta automáticamente** cuando la columna Open está vacía (albaranes cerrados)
+- ✅ **Corrige el desplazamiento** insertando la columna vacía en la posición correcta
+- ✅ **Reubica todas las columnas** automáticamente sin intervención manual
+- ✅ **Trabaja silenciosamente** sin spam de logs en la interfaz
+- ✅ **100% automático** - no requiere configuración adicional
+
+**Casos de uso:**
+- 📅 Reportes de fin de mes (cuando todo está cerrado)
+- 📊 Análisis de albaranes completados
+- 💾 Exportaciones Excel con datos precisos
 
 ## 🌟 Características Principales
 
@@ -14,7 +35,8 @@ Extractor profesional de PDFs con Camelot - Sistema completo de análisis de alb
 - ✅ **6 métodos de extracción** con selección automática del mejor
 - ✅ **8 funciones de autocorrección** que se ejecutan en pipeline
 - ✅ **Unión de saltos de línea** - Detecta y une códigos en filas siguientes (Tablets + Open)
-- ✅ **Corrección de columna Open vacía** - Detecta y corrige desplazamientos cuando todas las tablillas están cerradas
+- ✅ **Corrección de columna Open vacía** 🆕 - Detecta y corrige desplazamientos cuando todas las tablillas están cerradas (**perfecto para cierre de mes**)
+- ✅ **Priorización inteligente** - Método `stream_standard` optimizado para PDFs con columnas vacías
 - ✅ **Respeta tablillas cerradas** - NO inventa códigos, solo extrae lo que existe
 
 ### 📊 Dashboards Profesionales
@@ -83,33 +105,78 @@ Separa customer name cuando termina en "No" o "Yes"
 Corrige desplazamiento cuando Definitive="No"
 6. fix_tablets_total_split()
 Separa Total y Open cuando están mezclados
-7. fix_missing_open_column() 🆕
-Problema: Cuando todas las tablillas están cerradas, la columna Open está vacía en el PDF. Camelot no detecta columnas vacías, causando desplazamiento.
-Solución: Detecta el desplazamiento e inserta columna Open vacía, reubicando las columnas correctamente.
+7. fix_missing_open_column() 🆕 **CRÍTICO PARA CIERRE DE MES**
+**Problema:** En el último día del mes, cuando todas las tablillas están cerradas, la columna "Open" está completamente vacía en el PDF. Camelot no detecta columnas vacías, causando que todas las columnas posteriores (Tablets_Total, Counting_Delay, Validation_Delay) se desplacen una posición a la izquierda.
+
+**Detección Inteligente:**
+- ✅ Verifica si el albarán está cerrado (Definitive="Yes" + Counted_Date existe)
+- ✅ Detecta si col 14 NO tiene códigos con sufijos [MALT] (indicador de Open vacía)
+- ✅ Identifica si col 14 contiene un número simple (probablemente Tablets_Total desplazado)
+
+**Solución Automática:**
+- Inserta columna Open vacía en posición 14
+- Desplaza todas las columnas posteriores a la derecha
+- Mantiene la integridad de los datos sin modificar valores
+
+**Ejemplo:**
+```
+❌ ANTES (columnas desplazadas):
+Col 13: Total=4, Col 14: 5 (¿Open o Tablets_Total?), Col 15: 3
+
+✅ DESPUÉS (corrección automática):
+Col 13: Total=4, Col 14: (vacío - correcto), Col 15: 5, Col 16: 3
+```
+
 8. clean_open_tablets_when_closed()
-Limpia basura en Open cuando el albarán está definitivamente cerrado
+Limpia basura residual en Open cuando el albarán está definitivamente cerrado
 🎯 Casos de Uso
-Caso 1: Extracción de PDF
-bash1. Subir PDF en Tab "Extracción PDF"
+
+### Caso 1: Extracción de PDF (Último Día de Cierre) 🆕
+**Escenario:** Fin de mes, todas las tablillas están cerradas, columna "Open" vacía en el PDF
+
+```bash
+1. Subir PDF en Tab "Extracción PDF"
+2. Sistema detecta automáticamente:
+   ✓ Método stream_standard (priorizado)
+   ✓ Albaranes con Definitive="Yes"
+   ✓ Columna Open vacía
+3. Aplica corrección fix_missing_open_column():
+   ✓ Inserta columna Open vacía
+   ✓ Reubica Tablets_Total, Counting_Delay, Validation_Delay
+4. Muestra datos correctos en tabla
+5. Exportar a Excel profesional con 6 hojas
+   ✓ Todas las columnas en posición correcta
+   ✓ Sin desplazamientos
+   ✓ Datos precisos para reportes
+```
+
+### Caso 2: Extracción Normal (Con Tablillas Abiertas)
+```bash
+1. Subir PDF en Tab "Extracción PDF"
 2. Sistema prueba 6 métodos automáticamente
 3. Selecciona el mejor método
-4. Aplica las 6 correcciones en pipeline
+4. Aplica las 8 correcciones en pipeline
 5. Muestra validación con completitud %
 6. Exportar a Excel profesional con 6 hojas
-Caso 2: Análisis de Tablillas
-bash1. Extraer datos del PDF
+```
+### Caso 3: Análisis de Tablillas
+```bash
+1. Extraer datos del PDF
 2. Ir a Tab "Dashboard de Tablillas"
 3. Ver métricas globales (Total, Abiertas, Cerradas)
 4. Analizar por Warehouse y Cliente
 5. Revisar discrepancias de integridad
 6. Actuar sobre alertas inteligentes
-Caso 3: Análisis Histórico
-bash1. Ir a Tab "Análisis Histórico"
+```
+### Caso 4: Análisis Histórico
+```bash
+1. Ir a Tab "Análisis Histórico"
 2. Cargar múltiples archivos Excel (generados por la app)
 3. Ver evolución temporal de tablillas
 4. Analizar tendencias por warehouse
 5. Comparar tasas de cierre entre fechas
 6. Exportar consolidado con 3 hojas
+```
 🛠️ Métodos de Extracción
 El sistema prueba 6 métodos y selecciona automáticamente el mejor:
 MétodoDescripciónMejor paramethod_lattice_standardLattice estándarPDFs con tablas definidasmethod_stream_balancedStream balanceadoPDFs mixtosmethod_stream_standardStream estándarPDFs simplesmethod_stream_aggressiveStream agresivoPDFs complejosmethod_lattice_detailedLattice detalladoPDFs con muchas líneasmethod_hybridStream + LatticePDFs difíciles
@@ -132,26 +199,34 @@ Top clientes con tablillas abiertas
 Validación de integridad automática
 
 🐛 Troubleshooting
-PDF no extrae correctamente
 
-Verificar que el PDF tenga la estructura esperada
-Probar diferentes métodos en las pestañas
-Revisar el debug info para ver detalles
+### PDF no extrae correctamente
+✅ **Solución:** Verificar que el PDF tenga la estructura esperada
+- Probar diferentes métodos en las pestañas (stream_standard está priorizado)
+- La v3.1 maneja automáticamente columnas vacías
 
-Columnas desalineadas
+### Columnas desalineadas (Especialmente en cierre de mes)
+✅ **Solución v3.1:** Las 8 funciones de autocorrección ahora incluyen `fix_missing_open_column()`
+- Detecta y corrige automáticamente cuando Open está vacía
+- Reubica Tablets_Total, Counting_Delay, Validation_Delay
+- Trabaja silenciosamente sin intervención manual
 
-Las 6 funciones de autocorrección deberían resolver esto
-Si persiste, verificar que el PDF tenga 18 columnas
+### Columna "Open" aparece con números sin códigos [MALT]
+✅ **Solución:** Probablemente es desplazamiento de Tablets_Total
+- La v3.1 detecta automáticamente este caso
+- Verifica si Definitive="Yes" y Open no tiene sufijos [MALT]
+- Aplica corrección automática
 
-Discrepancias en Total vs Open
+### Discrepancias en Total vs Open
+ℹ️ **Normal:** Esto es ESPERADO cuando tablillas se cierran entre extracciones
+- El sistema solo reporta, NO inventa códigos
+- Discrepancias indican tablillas cerradas recientemente
+- Revisar Dashboard de Tablillas para detalles
 
-Esto es NORMAL cuando tablillas se cierran entre extracciones
-El sistema solo reporta, NO inventa códigos
-
-Análisis histórico no funciona
-
-Asegurarse de usar archivos Excel generados por esta app (v3.0)
-Los archivos deben tener la hoja "Datos_Principales"
+### Análisis histórico no funciona
+✅ **Solución:** Asegurarse de usar archivos Excel generados por esta app (v3.1)
+- Los archivos deben tener la hoja "Datos_Principales"
+- Archivos de v3.0 son compatibles
 
 📚 Documentación Adicional
 Ver HANDOFF.md para:
@@ -172,13 +247,22 @@ Diseñado para PDFs de "Outstanding Count Returns"
 Excel compatible con análisis histórico
 
 📦 Versión
-v3.1 - Corrección crítica para columna Open vacía (último día de cierre)
-Changelog v3.1
+v3.1 - Corrección Crítica para Cierre de Mes
+Changelog v3.1 (Noviembre 2025)
 
-✅ Nueva corrección: fix_missing_open_column()
-✅ Detecta cuando columna Open está completamente vacía
-✅ Corrige desplazamiento de columnas cuando tablillas cerradas
-✅ Soluciona problema de extracción en cierre de mes
+### 🎯 Mejoras Críticas
+✅ **Nueva corrección: fix_missing_open_column()** - Soluciona el problema #1 reportado en cierre de mes
+✅ **Detecta columna Open completamente vacía** - Cuando todas las tablillas están cerradas
+✅ **Corrige desplazamiento automático** - Reubica columnas sin intervención manual
+✅ **Prioriza method_stream_standard** - Optimizado para manejar columnas vacías
+✅ **Interfaz limpia** - Correcciones trabajan silenciosamente en segundo plano
+✅ **100% automático** - Sin configuración adicional requerida
+
+### 🔧 Mejoras de UX
+- Removidos logs excesivos de debug
+- Correcciones trabajan sin spam en interfaz
+- Mejor priorización de métodos de extracción
+- Mensajes de validación solo cuando son importantes
 
 Changelog v3.0
 
