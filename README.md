@@ -12,8 +12,9 @@ Extractor profesional de PDFs con Camelot - Sistema completo de análisis de alb
 - ✅ Soporte para **TODOS** los warehouses (RO-XX, 61D, 612D, 298T, etc.)
 - ✅ Detección automática de slip numbers (`7290000XXXXX`)
 - ✅ **6 métodos de extracción** con selección automática del mejor
-- ✅ **6 funciones de autocorrección** que se ejecutan en pipeline
+- ✅ **8 funciones de autocorrección** que se ejecutan en pipeline
 - ✅ **Unión de saltos de línea** - Detecta y une códigos en filas siguientes (Tablets + Open)
+- ✅ **Corrección de columna Open vacía** - Detecta y corrige desplazamientos cuando todas las tablillas están cerradas
 - ✅ **Respeta tablillas cerradas** - NO inventa códigos, solo extrae lo que existe
 
 ### 📊 Dashboards Profesionales
@@ -62,7 +63,7 @@ streamlit run app.py
 Columnas Esperadas (18 columnas)
 #ColumnaDescripciónEjemplo0WhEstado (FL, DL, TX, CA, NY)FL1Return_PrefixWarehouse code61D, 612D, RO-FL2Return_SlipSlip number7290000188223Return_DateFecha de retorno10/1/20254JobsiteCódigo de obra400366455Cost_CenterCentro de costoFL0526Invoice_Date1Fecha factura 18/31/20257Invoice_Date2Fecha factura 29/30/20258CustomerNombre del clienteThales Builders Corp9Job_NameNombre del proyectoResidences at Martin10DefinitiveDefinitivo (Yes/No)No11Counted_DateFecha de conteo10/5/202512TabletsCódigos de tablillas1321, 1656, 166113TotalTotal tablillas ABIERTAS314OpenCódigos tablillas abiertas1656T, 1661A, 1665T15Tablets_TotalTotal de tablillas416Counting_DelayDías de retraso conteo517Validation_DelayDías retraso validación0
 🔧 Sistema de Correcciones Automáticas
-El sistema ejecuta 6 funciones de autocorrección en secuencia:
+El sistema ejecuta 8 funciones de autocorrección en secuencia:
 1. merge_continuation_rows() 🆕 MEJORADO
 Problema: Códigos de tablillas en salto de línea
 Fila actual:  Tablets = "1703, 1707, 1710, 1728,"
@@ -82,6 +83,11 @@ Separa customer name cuando termina en "No" o "Yes"
 Corrige desplazamiento cuando Definitive="No"
 6. fix_tablets_total_split()
 Separa Total y Open cuando están mezclados
+7. fix_missing_open_column() 🆕
+Problema: Cuando todas las tablillas están cerradas, la columna Open está vacía en el PDF. Camelot no detecta columnas vacías, causando desplazamiento.
+Solución: Detecta el desplazamiento e inserta columna Open vacía, reubicando las columnas correctamente.
+8. clean_open_tablets_when_closed()
+Limpia basura en Open cuando el albarán está definitivamente cerrado
 🎯 Casos de Uso
 Caso 1: Extracción de PDF
 bash1. Subir PDF en Tab "Extracción PDF"
@@ -166,7 +172,14 @@ Diseñado para PDFs de "Outstanding Count Returns"
 Excel compatible con análisis histórico
 
 📦 Versión
-v3.0 Final - Sistema completo con Dashboard Inteligente de Tablillas y Excel Profesional
+v3.1 - Corrección crítica para columna Open vacía (último día de cierre)
+Changelog v3.1
+
+✅ Nueva corrección: fix_missing_open_column()
+✅ Detecta cuando columna Open está completamente vacía
+✅ Corrige desplazamiento de columnas cuando tablillas cerradas
+✅ Soluciona problema de extracción en cierre de mes
+
 Changelog v3.0
 
 ✅ Dashboard Inteligente de Tablillas

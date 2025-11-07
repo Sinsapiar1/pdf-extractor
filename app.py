@@ -1,7 +1,7 @@
 # camelot_extractor_pro_final_v3.py
 """
 Extractor Profesional de PDFs con Camelot + Dashboard Inteligente
-VERSIÓN 3.0 - Exportación Excel Mejorada + Análisis Histórico Avanzado
+VERSIÓN 3.1 - Corrección para columna Open vacía (último día de cierre)
 """
 
 import streamlit as st
@@ -49,7 +49,12 @@ def render_header():
 # ============================================================================
 
 class CamelotExtractorPro:
-    """Extractor especializado - versión profesional con correcciones universales"""
+    """
+    Extractor especializado - versión profesional con 8 correcciones universales
+    
+    Versión 3.1 - Incluye corrección crítica para columna Open vacía cuando 
+    todas las tablillas están cerradas (último día de cierre de mes)
+    """
 
     def __init__(self):
         self.extraction_methods = [
@@ -169,8 +174,79 @@ class CamelotExtractorPro:
             st.error(f"Error en merge_continuation_rows: {e}")
             return df
 
+    def fix_missing_open_column(self, row_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        CRÍTICO: Corrige desplazamiento cuando columna Open está completamente vacía.
+        
+        Problema: Cuando todas las tablillas están cerradas, la columna Open (col 14) 
+        está vacía en el PDF. Camelot NO detecta columnas vacías, causando que todas 
+        las columnas posteriores se desplacen una posición a la izquierda.
+        
+        Detección:
+        - Definitive = "Yes" o "Ye" (albarán cerrado)
+        - Counted_Date existe y no está vacía
+        - Col 14 NO tiene códigos con sufijos [MALT]
+        - Col 14 parece ser un número simple (probablemente Tablets_Total desplazado)
+        
+        Solución:
+        - Insertar columna vacía en posición 14 (Open)
+        - Desplazar todo desde col 14 hasta col 17 hacia la derecha
+        """
+        try:
+            if len(row_data.columns) < 18:
+                return row_data
+
+            definitive = str(row_data.iloc[0, 10]).strip()
+            counted_date = str(row_data.iloc[0, 11]).strip()
+            tablets = str(row_data.iloc[0, 12]).strip()
+            total = str(row_data.iloc[0, 13]).strip()
+            col_14 = str(row_data.iloc[0, 14]).strip()
+            
+            # Verificar si el albarán está cerrado
+            is_closed = definitive in ['Yes', 'Ye', 'yes', 'ye', 'YES', 'YE'] and \
+                       counted_date and counted_date not in ['', 'nan', 'None']
+            
+            if is_closed:
+                # Verificar si col 14 NO tiene códigos [MALT] (indicador de Open)
+                has_malt_codes = bool(re.search(r'\d+[MALT]', col_14))
+                
+                # Verificar si col 14 parece ser un número simple (probablemente Tablets_Total desplazado)
+                is_simple_number = col_14.isdigit() and len(col_14) <= 3
+                
+                # Si col 14 NO tiene códigos [MALT] Y parece ser un número simple
+                if not has_malt_codes and is_simple_number:
+                    st.warning(f"⚠️ Detectado desplazamiento: Col 14 = '{col_14}' (sin códigos [MALT])")
+                    st.info("🔧 Insertando columna Open vacía y desplazando columnas...")
+                    
+                    # Guardar valores desde col 14 hasta col 17
+                    saved_values = []
+                    for col_idx in range(14, min(18, len(row_data.columns))):
+                        saved_values.append(str(row_data.iloc[0, col_idx]))
+                    
+                    # Col 14 (Open) debe estar vacía cuando está cerrado
+                    row_data.iloc[0, 14] = ''
+                    
+                    # Desplazar valores guardados hacia la derecha
+                    for i, val in enumerate(saved_values):
+                        new_col = 15 + i
+                        if new_col < len(row_data.columns):
+                            row_data.iloc[0, new_col] = val
+                    
+                    st.success(f"✅ Open vacía insertada. Tablets_Total = {saved_values[0] if saved_values else 'N/A'}")
+                
+                # Caso adicional: Si col 14 tiene un número pequeño sin [MALT], limpiarlo
+                elif col_14 and not has_malt_codes:
+                    if col_14.isdigit() and int(col_14) <= 5:
+                        st.info(f"🧹 Limpiando basura en Open: '{col_14}'")
+                        row_data.iloc[0, 14] = ''
+
+            return row_data
+        except Exception as e:
+            st.error(f"Error en fix_missing_open_column: {e}")
+            return row_data
+
     def clean_open_tablets_when_closed(self, row_data: pd.DataFrame) -> pd.DataFrame:
-        """Limpia Open_Tablets cuando el albarán está cerrado"""
+        """Limpia Open_Tablets cuando el albarán está cerrado (función legacy, ahora manejada por fix_missing_open_column)"""
         try:
             if len(row_data.columns) < 15:
                 return row_data
@@ -516,6 +592,7 @@ class CamelotExtractorPro:
                                 row_data = self.fix_customer_definitive_split(row_data)
                                 row_data = self.fix_column_shift_after_definitive(row_data)
                                 row_data = self.fix_tablets_total_split(row_data)
+                                row_data = self.fix_missing_open_column(row_data)  # NUEVA: Corrige desplazamiento cuando Open vacía
                                 row_data = self.clean_open_tablets_when_closed(row_data)
                                 all_data.append(row_data)
                     except:
@@ -1501,11 +1578,12 @@ def main():
         with st.sidebar:
             st.header("📊 Información del Sistema")
             st.info("""
-            **Versión 3.0 Final**
+            **Versión 3.1**
 
             ✨ **Características**:
             - ✅ Saltos de línea (Tablets + Open)
-            - ✅ 6 correcciones universales
+            - ✅ 8 correcciones universales
+            - ✅ Corrección columna Open vacía 🆕
             - ✅ Validación inteligente
             - ✅ Excel con múltiples hojas
             - ✅ Análisis histórico avanzado
