@@ -1,3 +1,4 @@
 ghostscript
 libgl1
 python3-tk
+libglib2.0-0
