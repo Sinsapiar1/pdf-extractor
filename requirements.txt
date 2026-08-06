@@ -1,5 +1,5 @@
 streamlit==1.36.0
-camelot-py[cv]==0.11.0
+camelot-py==0.11.0
 opencv-python-headless==4.7.0.72
 pandas==2.2.2
 numpy==1.26.4
