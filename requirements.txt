@@ -3,6 +3,7 @@ camelot-py==0.11.0
 opencv-python-headless==4.7.0.72
 pandas==2.2.2
 numpy==1.26.4
+pyarrow==16.1.0
 openpyxl==3.1.5
 plotly==5.22.0
 holidays==0.50

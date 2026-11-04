@@ -89,9 +89,13 @@ CAMELOT_STREAM_COLUMNS = [
 
 SLIP_PATTERN = re.compile(r'^7290000\d{5}$')
 SLIP_SEARCH_PATTERN = re.compile(r'7290000\d{5}')
-HEADER_OFFSET = 497          # el encabezado de página termina en page.height - 497
+HEADER_OFFSET = 497          # respaldo: el encabezado termina en page.height - 497
+HEADER_LINE_RANGE = (40.0, 200.0)  # rango de 'top' donde buscar la línea bajo el encabezado
 ROW_TOP_MARGIN = 2.5         # margen superior de la ventana vertical de cada fila
-ROW_HEIGHT = 11.0            # alto máximo (2 líneas) de cada fila
+ROW_HEIGHT = 11.0            # alto base de una fila de 2 líneas
+ROW_MAX_HEIGHT = 18.0        # alto máximo si la fila ocupa 3 líneas
+ROW_LINE_GAP = 10.0          # separación máxima entre líneas consecutivas de una misma fila
+MULTILINE_COLS = (8, 9, 10, 12, 14)  # Customer, Job_Name, Definitive, Tablets, Open_Tablets
 CRITICAL_DELAY_DAYS = 20     # Counting_Delay >= 20 días => albarán crítico
 EMPTY_MARKERS = ('', 'nan', 'none', 'nat')
 
@@ -685,19 +689,84 @@ class CamelotExtractorPro:
                 return idx
         return len(COL_BOUNDS) - 1
 
+    @staticmethod
+    def _detect_header_limit(page) -> float:
+        """
+        'top' de la línea horizontal bajo el encabezado de la tabla.
+
+        El encabezado cambia de alto entre la primera página y las siguientes,
+        por lo que se lee la geometría real de la página; si no hay líneas se usa
+        el valor fijo page.height - 497.
+        """
+        try:
+            low, high = HEADER_LINE_RANGE
+            tops = [ln['top'] for ln in page.lines
+                    if abs(ln['bottom'] - ln['top']) < 1.0 and ln['x0'] < COL_BOUNDS[1][0]
+                    and low <= ln['top'] <= high]
+            if tops:
+                return max(tops)
+        except Exception:
+            pass
+        return page.height - HEADER_OFFSET
+
+    @staticmethod
+    def _cluster_lines(words: List[Dict], tolerance: float = 3.0) -> List[List[Dict]]:
+        """Agrupa palabras en líneas visuales según su coordenada 'top'."""
+        lines: List[List[Dict]] = []
+        for w in sorted(words, key=lambda item: item['top']):
+            if lines and w['top'] - lines[-1][0]['top'] <= tolerance:
+                lines[-1].append(w)
+            else:
+                lines.append([w])
+        return lines
+
+    def _collect_row_words(self, body_words: List[Dict], sy: float,
+                           next_sy: Optional[float]) -> List[List[Dict]]:
+        """
+        Líneas visuales que pertenecen a la fila del albarán que empieza en sy.
+
+        - Ventana base: [sy - 2.5, sy + 11.0] (2 líneas), siempre acotada por la
+          fila siguiente (next_sy - 2.5).
+        - Si la fila ocupa 3 líneas, la ventana se extiende hasta sy + 18.0 solo
+          mientras las líneas sean contiguas (<= 10 pt entre sí) y contengan
+          únicamente columnas multilínea; así no se absorbe la fila de totales
+          del pie (cols 13 y 15) ni texto ajeno a la fila.
+        """
+        window_bottom = sy + ROW_MAX_HEIGHT
+        if next_sy is not None:
+            window_bottom = min(window_bottom, next_sy - ROW_TOP_MARGIN)
+
+        candidates = [w for w in body_words if sy - ROW_TOP_MARGIN <= w['top'] <= window_bottom]
+        accepted: List[List[Dict]] = []
+
+        for line in self._cluster_lines(candidates):
+            line_top = min(w['top'] for w in line)
+            if accepted:
+                previous_top = min(w['top'] for w in accepted[-1])
+                if line_top - previous_top > ROW_LINE_GAP:
+                    break
+                if line_top - sy > ROW_HEIGHT:
+                    columns = {self._column_index_for_x((w['x0'] + w['x1']) / 2) for w in line}
+                    if not columns.issubset(MULTILINE_COLS):
+                        break
+            accepted.append(line)
+
+        return accepted
+
     def _extract_page_rows_by_coordinates(self, page, is_last_page: bool) -> Tuple[List[List[str]], Optional[Dict]]:
         """
         Extrae las filas de una página por coordenadas exactas.
 
         Cada albarán (palabra 7290000XXXXX en la col 2) define una ventana
-        vertical [sy - 2.5, min(sy + 11.0, next_sy - 2.5)] que captura también la
-        segunda línea de las celdas con salto de línea (Customer, Job_Name,
-        Definitive "Ye"+"s", Tablets, Open_Tablets).
+        vertical que parte en sy - 2.5 y termina de forma dinámica (ver
+        _collect_row_words): captura la segunda línea (+7.7 pt) de Customer,
+        Job_Name, Definitive ("Ye" + "s"), Tablets y Open_Tablets, y se extiende
+        hasta 18 pt cuando esas celdas ocupan 3 líneas.
         """
         words = page.extract_words(x_tolerance=2.5, y_tolerance=1.5, keep_blank_chars=False)
 
-        header_limit = page.height - HEADER_OFFSET
-        body_words = [w for w in words if w['top'] > header_limit]
+        header_limit = self._detect_header_limit(page)
+        body_words = [w for w in words if w['top'] >= header_limit]
 
         def find_slip_tops(candidates):
             return sorted(
@@ -714,18 +783,15 @@ class CamelotExtractorPro:
             slip_tops = find_slip_tops(body_words)
 
         rows = []
+        assigned_ids = set()
         for i, sy in enumerate(slip_tops):
             next_sy = slip_tops[i + 1] if i + 1 < len(slip_tops) else None
-            window_top = sy - ROW_TOP_MARGIN
-            window_bottom = sy + ROW_HEIGHT
-            if next_sy is not None:
-                window_bottom = min(window_bottom, next_sy - ROW_TOP_MARGIN)
 
             cells = [[] for _ in COL_BOUNDS]
-            for w in body_words:
-                if window_top <= w['top'] <= window_bottom:
+            for line_idx, line in enumerate(self._collect_row_words(body_words, sy, next_sy)):
+                for w in line:
+                    assigned_ids.add(id(w))
                     col_idx = self._column_index_for_x((w['x0'] + w['x1']) / 2)
-                    line_idx = 0 if (w['top'] - sy) < 4.0 else 1
                     cells[col_idx].append((line_idx, w['x0'], w['text']))
 
             row = []
@@ -737,14 +803,15 @@ class CamelotExtractorPro:
 
         footer = None
         if is_last_page:
-            footer_min_top = (slip_tops[-1] + ROW_HEIGHT) if slip_tops else header_limit
-            footer = self._detect_footer_totals(body_words, footer_min_top)
+            last_sy = slip_tops[-1] if slip_tops else header_limit
+            leftovers = [w for w in body_words if w['top'] > last_sy and id(w) not in assigned_ids]
+            footer = self._detect_footer_totals(leftovers)
 
         return rows, footer
 
-    def _detect_footer_totals(self, words: List[Dict], min_top: float) -> Optional[Dict]:
-        """Fila de totales globales del PDF (cols 13 y 15) bajo la última fila de datos."""
-        candidates = sorted((w for w in words if w['top'] > min_top), key=lambda w: w['top'])
+    def _detect_footer_totals(self, words: List[Dict]) -> Optional[Dict]:
+        """Fila de totales globales del PDF (cols 13 y 15) entre las palabras no asignadas a filas."""
+        candidates = sorted(words, key=lambda w: w['top'])
 
         lines: List[List[Dict]] = []
         for w in candidates:
