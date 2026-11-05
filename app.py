@@ -2915,6 +2915,273 @@ def render_snapshot_comparison(files: Dict[str, pd.DataFrame]):
 
 
 # ============================================================================
+# VISTA EXPRESS: COLUMNAS CLAVE POR ALMACÉN (PANTALLA, EXCEL Y PDF)
+# ============================================================================
+
+EXPRESS_HEADERS = ['Warehouse', 'Albarán', 'Fecha', 'Jobsite', 'Cliente', 'Obra',
+                   'Tablillas', 'Total', 'Tablillas abiertas', 'Abiertas']
+
+
+def build_express_table(df: pd.DataFrame, warehouses: Optional[List[str]] = None,
+                        only_open: bool = True) -> pd.DataFrame:
+    """
+    Vista corta de 10 columnas: Warehouse, Albarán, Fecha, Jobsite, Cliente, Obra,
+    Tablillas, Total, Tablillas abiertas y Abiertas. Filtra por almacén (Return_Prefix),
+    opcionalmente solo albaranes con tablillas abiertas, ordenada por fecha de retorno.
+    """
+    named = prepare_named_df(df)
+    if named.empty:
+        return pd.DataFrame(columns=EXPRESS_HEADERS)
+
+    if warehouses:
+        named = named[named['Return_Prefix'].isin(warehouses)]
+    if only_open:
+        named = named[named['Open_Total'] > 0]
+
+    named = named.assign(_date=pd.to_datetime(named['Return_Date'], format='%m/%d/%Y', errors='coerce'))
+    named = named.sort_values(['_date', 'Return_Slip'], kind='stable', na_position='last')
+
+    table = pd.DataFrame({
+        'Warehouse': named['Return_Prefix'],
+        'Albarán': named['Return_Slip'],
+        'Fecha': named['Return_Date'],
+        'Jobsite': named['Jobsite'],
+        'Cliente': named['Customer'],
+        'Obra': named['Job_Name'],
+        'Tablillas': named['Tablets'],
+        'Total': named['Total_Tablets'].astype(int),
+        'Tablillas abiertas': named['Open_Tablets'],
+        'Abiertas': named['Open_Total'].astype(int),
+    })
+    return table.reset_index(drop=True)
+
+
+def _express_title(warehouses: Optional[List[str]], only_open: bool) -> str:
+    scope = 'Tablillas abiertas' if only_open else 'Albaranes'
+    where = ', '.join(warehouses) if warehouses else 'todos los almacenes'
+    return f"{scope} · {where}"
+
+
+def export_express_excel(table: pd.DataFrame, title: str = "") -> bytes:
+    """
+    Excel express: tabla con filtros y bandas, encabezados TOTAL / ABIERTAS en verde y
+    salmón, y totales con SUBTOTAL (se recalculan si filtras en Excel).
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Express'
+
+    ws.append(EXPRESS_HEADERS)
+    n_rows = len(table)
+    for record in table.itertuples(index=False):
+        slip, jobsite = record[1], record[3]
+        date = pd.to_datetime(record[2], format='%m/%d/%Y', errors='coerce')
+        ws.append([
+            record[0],
+            int(slip) if str(slip).isdigit() else slip,
+            date.to_pydatetime() if pd.notna(date) else record[2],
+            int(jobsite) if str(jobsite).isdigit() else jobsite,
+            record[4], record[5], record[6], int(record[7]), record[8], int(record[9]),
+        ])
+
+    widths = [11, 16, 12, 12, 30, 30, 26, 8, 20, 10]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+
+    wrap_cols = {5, 6, 7, 9}
+    for row in ws.iter_rows(min_row=2, max_row=n_rows + 1):
+        for cell in row:
+            col = cell.column
+            cell.alignment = Alignment(vertical='center', wrap_text=col in wrap_cols,
+                                       horizontal='center' if col in (1, 8, 9, 10) else None)
+            if col == 3:
+                cell.number_format = 'm/d/yyyy'
+            if col in (2, 4):
+                cell.number_format = '0'
+            if col in (9, 10):
+                cell.font = Font(bold=True)
+
+    header_font = Font(bold=True, color='FFFFFF')
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    ws.row_dimensions[1].height = 22
+
+    if n_rows:
+        last_col = get_column_letter(len(EXPRESS_HEADERS))
+        excel_table = Table(displayName='Express', ref=f"A1:{last_col}{n_rows + 1}")
+        excel_table.tableStyleInfo = TableStyleInfo(name='TableStyleMedium2', showRowStripes=True)
+        ws.add_table(excel_table)
+        ws.freeze_panes = 'A2'
+
+        first, last = 2, n_rows + 1
+        label_fill = PatternFill('solid', start_color='0B2545', end_color='0B2545')
+        white_bold = Font(bold=True, color='FFFFFF', size=12)
+        totals = [('TOTAL:', 'H', 8), ('ABIERTAS:', 'J', 10)]
+        for offset, (label, letter, col_idx) in enumerate(totals):
+            row = n_rows + 3 + offset
+            ws.cell(row=row, column=col_idx - 1, value=label)
+            ws.cell(row=row, column=col_idx, value=f"=SUBTOTAL(109,{letter}{first}:{letter}{last})")
+            for col in (col_idx - 1, col_idx):
+                cell = ws.cell(row=row, column=col)
+                cell.fill, cell.font = label_fill, white_bold
+                cell.alignment = Alignment(horizontal='center')
+
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = '1:1'
+    if title:
+        ws.oddHeader.center.text = title
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def export_express_pdf(table: pd.DataFrame, title: str = "") -> bytes:
+    """PDF express apaisado (carta) con la misma tabla, encabezado repetido y totales."""
+    import html
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import landscape, letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    def safe(value) -> str:
+        # Helvetica solo cubre Latin-1: lo demás se reemplaza para no dibujar cuadros negros.
+        text = str(value).encode('latin-1', 'replace').decode('latin-1')
+        return html.escape(text)
+
+    cell = ParagraphStyle('cell', fontName='Helvetica', fontSize=7.5, leading=9)
+    bold = ParagraphStyle('bold', parent=cell, fontName='Helvetica-Bold', alignment=1)
+    centered = ParagraphStyle('centered', parent=cell, alignment=1)
+    head = ParagraphStyle('head', parent=cell, fontName='Helvetica-Bold', textColor=colors.white, alignment=1)
+    head_dark = ParagraphStyle('head_dark', parent=head, textColor=colors.HexColor('#3d1f0a'))
+
+    data = [[Paragraph(safe(h), head_dark if h == 'Abiertas' else head) for h in EXPRESS_HEADERS]]
+    for r in table.itertuples(index=False):
+        data.append([
+            Paragraph(safe(r[0]), centered), Paragraph(safe(r[1]), cell), Paragraph(safe(r[2]), cell),
+            Paragraph(safe(r[3]), cell), Paragraph(safe(r[4]), cell), Paragraph(safe(r[5]), cell),
+            Paragraph(safe(r[6]), cell), Paragraph(safe(r[7]), centered),
+            Paragraph(safe(r[8]), bold), Paragraph(safe(r[9]), bold),
+        ])
+
+    widths = [54, 72, 50, 52, 124, 124, 112, 30, 62, 48]
+    pdf_table = Table(data, colWidths=widths, repeatRows=1)
+    style = [
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#156082')),
+        ('BACKGROUND', (7, 0), (7, 0), colors.HexColor('#4EA72E')),
+        ('BACKGROUND', (9, 0), (9, 0), colors.HexColor('#F4B183')),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#7f8c8d')),
+        ('TOPPADDING', (0, 0), (-1, -1), 2.5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+    ]
+    for row in range(1, len(data)):
+        if row % 2 == 1:
+            style.append(('BACKGROUND', (0, row), (-1, row), colors.HexColor('#C0E4F5')))
+    pdf_table.setStyle(TableStyle(style))
+
+    total = int(table['Total'].sum()) if len(table) else 0
+    open_total = int(table['Abiertas'].sum()) if len(table) else 0
+    totals = Table([[f"TOTAL: {total:,}", f"ABIERTAS: {open_total:,}"]], colWidths=[130, 150], hAlign='RIGHT')
+    totals.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#0B2545')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.white),
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 11),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+    ]))
+
+    styles = getSampleStyleSheet()
+    stamp = datetime.now().strftime('%m/%d/%Y %H:%M')
+    story = [
+        Paragraph(safe(title or 'Vista express'), styles['Heading2']),
+        Paragraph(f"{len(table)} albarán(es) · generado {stamp}", styles['Normal']),
+        Spacer(1, 8), pdf_table, Spacer(1, 10), totals,
+    ]
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont('Helvetica', 8)
+        canvas.drawRightString(landscape(letter)[0] - 24, 14, f"Página {doc.page}")
+        canvas.restoreState()
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), leftMargin=24, rightMargin=24,
+                            topMargin=24, bottomMargin=28, title=title or 'Vista express')
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buffer.getvalue()
+
+
+def create_express_view(df: pd.DataFrame):
+    """Pestaña express: segmentador por almacén + descarga rápida en Excel y PDF."""
+    st.header("⚡ Vista Express")
+    st.markdown("**Solo las columnas clave: elige el almacén y descarga.**")
+
+    try:
+        named = prepare_named_df(df)
+        if named.empty:
+            st.info("No hay datos para mostrar")
+            return
+
+        warehouse_options = sorted(w for w in named['Return_Prefix'].unique() if w)
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            chosen = st.multiselect("Almacén (Warehouse)", warehouse_options, key='express_wh',
+                                    placeholder="Todos los almacenes")
+        with col2:
+            only_open = st.toggle("Solo con tablillas abiertas", value=True, key='express_open')
+
+        table = build_express_table(df, chosen, only_open)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Albaranes", len(table))
+        col2.metric("Total tablillas", int(table['Total'].sum()) if len(table) else 0)
+        col3.metric("Tablillas abiertas", int(table['Abiertas'].sum()) if len(table) else 0)
+
+        if table.empty:
+            st.info("No hay albaranes con esa selección")
+            return
+
+        st.dataframe(table, use_container_width=True, hide_index=True, height=480,
+                     column_config={
+                         'Total': st.column_config.NumberColumn('Total', format="%d"),
+                         'Abiertas': st.column_config.NumberColumn('Abiertas', format="%d"),
+                     })
+        st.caption("Usa todo el PDF; este segmentador es independiente de los filtros del menú lateral. "
+                   "Ordenado por fecha de retorno.")
+
+        title = _express_title(chosen, only_open)
+        suffix = '_'.join(chosen) if chosen else 'todos'
+        stamp = datetime.now().strftime('%Y%m%d_%H%M')
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("📊 Descargar Excel express", export_express_excel(table, title),
+                               f"express_{suffix}_{stamp}.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key='dl_express_xlsx', use_container_width=True)
+        with col2:
+            st.download_button("📄 Descargar PDF express", export_express_pdf(table, title),
+                               f"express_{suffix}_{stamp}.pdf", "application/pdf",
+                               key='dl_express_pdf', use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error creando la vista express: {e}")
+        import traceback
+        st.error(traceback.format_exc())
+
+
+# ============================================================================
 # FILTROS GLOBALES Y TABLA INTERACTIVA
 # ============================================================================
 
@@ -3066,6 +3333,7 @@ def main():
 
     main_tabs = st.tabs([
         "📄 Extracción PDF",
+        "⚡ Vista Express",
         "📊 Análisis de Albaranes",
         "📦 Dashboard de Tablillas",
         "🎯 Control de Tablillas",
@@ -3215,10 +3483,7 @@ def main():
 
     with main_tabs[1]:
         if has_data:
-            if filtered_data.empty:
-                st.warning("No hay albaranes que coincidan con los filtros seleccionados")
-            else:
-                create_analysis_dashboard(filtered_data)
+            create_express_view(extracted_data)
         else:
             st.info("💡 Primero extrae datos del PDF en la pestaña 'Extracción PDF'")
 
@@ -3227,7 +3492,7 @@ def main():
             if filtered_data.empty:
                 st.warning("No hay albaranes que coincidan con los filtros seleccionados")
             else:
-                create_tablets_dashboard(filtered_data, full_df=extracted_data)
+                create_analysis_dashboard(filtered_data)
         else:
             st.info("💡 Primero extrae datos del PDF en la pestaña 'Extracción PDF'")
 
@@ -3236,11 +3501,20 @@ def main():
             if filtered_data.empty:
                 st.warning("No hay albaranes que coincidan con los filtros seleccionados")
             else:
-                create_tablet_control_tab(filtered_data, full_df=extracted_data)
+                create_tablets_dashboard(filtered_data, full_df=extracted_data)
         else:
             st.info("💡 Primero extrae datos del PDF en la pestaña 'Extracción PDF'")
 
     with main_tabs[4]:
+        if has_data:
+            if filtered_data.empty:
+                st.warning("No hay albaranes que coincidan con los filtros seleccionados")
+            else:
+                create_tablet_control_tab(filtered_data, full_df=extracted_data)
+        else:
+            st.info("💡 Primero extrae datos del PDF en la pestaña 'Extracción PDF'")
+
+    with main_tabs[5]:
         create_historical_dashboard()
 
 
