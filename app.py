@@ -109,6 +109,8 @@ def clean_cell(value) -> str:
             return ''
     except (TypeError, ValueError):
         pass
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     text = str(value).strip()
     return '' if text.lower() in EMPTY_MARKERS else text
 
@@ -195,10 +197,11 @@ class CoordinateTable:
 
     is_coordinate_exact = True
 
-    def __init__(self, df: pd.DataFrame, page_number: int):
+    def __init__(self, df: pd.DataFrame, page_number: int, audit: Optional[Dict] = None):
         self.df = df
         self.page = page_number
         self.accuracy = 100.0
+        self.audit = audit or {}
 
 
 # ============================================================================
@@ -225,13 +228,28 @@ class CamelotExtractorPro:
             self.method_hybrid
         ]
 
-    def extract_with_all_methods(self, pdf_path: str) -> Dict:
-        """Prueba todos los métodos y compara resultados"""
+    def extract_with_all_methods(self, pdf_path: str, run_all: bool = False) -> Dict:
+        """
+        Prueba los métodos de extracción en orden de prioridad.
+
+        Si la extracción por coordenadas queda verificada (cuadra 100% con el pie
+        del PDF, sin discrepancias de integridad y sin texto sin asignar), los
+        métodos de respaldo de Camelot se omiten porque son lentos y no aportan.
+        Con run_all=True se ejecutan todos para compararlos.
+        """
         results = {}
         st.session_state.pop('pdf_footer_totals', None)
+        st.session_state.pop('coordinate_audit', None)
 
-        for method in self.extraction_methods:
+        for position, method in enumerate(self.extraction_methods):
             method_name = method.__name__
+
+            if position > 0 and not run_all:
+                primary = results.get(self.extraction_methods[0].__name__, {})
+                if primary.get('success') and is_extraction_verified(primary.get('data')):
+                    results[method_name] = {'success': False, 'skipped': True}
+                    continue
+
             try:
                 with st.spinner(f"Probando {method_name}..."):
                     tables = method(pdf_path)
@@ -795,7 +813,7 @@ class CamelotExtractorPro:
 
         return accepted
 
-    def _extract_page_rows_by_coordinates(self, page, is_last_page: bool) -> Tuple[List[List[str]], Optional[Dict]]:
+    def _extract_page_rows_by_coordinates(self, page, is_last_page: bool) -> Tuple[List[List[str]], Optional[Dict], Dict]:
         """
         Extrae las filas de una página por coordenadas exactas.
 
@@ -804,8 +822,13 @@ class CamelotExtractorPro:
         _collect_row_words): captura la segunda línea (+7.7 pt) de Customer,
         Job_Name, Definitive ("Ye" + "s"), Tablets y Open_Tablets, y se extiende
         hasta 18 pt cuando esas celdas ocupan 3 líneas.
+
+        Devuelve (filas, totales del pie, auditoría). La auditoría permite
+        verificar que no se perdió texto: albaranes presentes en el texto del
+        PDF y palabras de la tabla que no quedaron asignadas a ninguna fila.
         """
         words = page.extract_words(x_tolerance=2.5, y_tolerance=1.5, keep_blank_chars=False)
+        slips_in_text = sum(1 for w in words if SLIP_PATTERN.match(w['text']))
 
         geometry = self._get_page_geometry(page)
         bounds = geometry['bounds']
@@ -845,15 +868,28 @@ class CamelotExtractorPro:
             rows.append(row)
 
         footer = None
+        footer_ids = set()
         if is_last_page:
             last_sy = slip_tops[-1] if slip_tops else header_limit
             leftovers = [w for w in body_words if w['top'] > last_sy and id(w) not in assigned_ids]
-            footer = self._detect_footer_totals(leftovers, bounds)
+            footer, footer_words = self._detect_footer_totals(leftovers, bounds)
+            footer_ids = {id(w) for w in footer_words}
 
-        return rows, footer
+        unassigned = [w['text'] for w in body_words
+                      if id(w) not in assigned_ids and id(w) not in footer_ids]
+        audit = {
+            'rows': len(rows),
+            'slips_in_text': slips_in_text,
+            'unassigned': unassigned,
+        }
+        return rows, footer, audit
 
-    def _detect_footer_totals(self, words: List[Dict], bounds: List[Tuple[float, float]] = COL_BOUNDS) -> Optional[Dict]:
-        """Fila de totales globales del PDF (cols 13 y 15) entre las palabras no asignadas a filas."""
+    def _detect_footer_totals(self, words: List[Dict],
+                              bounds: List[Tuple[float, float]] = COL_BOUNDS) -> Tuple[Optional[Dict], List[Dict]]:
+        """
+        Fila de totales globales del PDF (cols 13 y 15) entre las palabras no asignadas a filas.
+        Devuelve (totales o None, palabras de esa línea).
+        """
         candidates = sorted(words, key=lambda w: w['top'])
 
         lines: List[List[Dict]] = []
@@ -874,8 +910,8 @@ class CamelotExtractorPro:
                 elif col_idx == 15 and col_15 is None:
                     col_15 = int(w['text'])
             if col_13 is not None and col_15 is not None:
-                return {'total_tablets': col_13, 'total_open': col_15}
-        return None
+                return {'total_tablets': col_13, 'total_open': col_15}, line
+        return None, []
 
     def method_coordinate_precision(self, pdf_path: str):
         """
@@ -889,19 +925,29 @@ class CamelotExtractorPro:
         try:
             tables = []
             footer_totals = None
+            page_audits = []
 
             with pdfplumber.open(pdf_path) as pdf:
                 total_pages = len(pdf.pages)
                 for page_idx, page in enumerate(pdf.pages):
-                    rows, page_footer = self._extract_page_rows_by_coordinates(
+                    rows, page_footer, audit = self._extract_page_rows_by_coordinates(
                         page, is_last_page=(page_idx == total_pages - 1))
+                    audit['page'] = page_idx + 1
+                    page_audits.append(audit)
                     if rows:
-                        tables.append(CoordinateTable(pd.DataFrame(rows), page_idx + 1))
+                        tables.append(CoordinateTable(pd.DataFrame(rows), page_idx + 1, audit))
                     if page_footer:
                         footer_totals = page_footer
 
             if footer_totals:
                 st.session_state['pdf_footer_totals'] = footer_totals
+            st.session_state['coordinate_audit'] = {
+                'pages': total_pages,
+                'rows': sum(a['rows'] for a in page_audits),
+                'slips_in_text': sum(a['slips_in_text'] for a in page_audits),
+                'unassigned': [(a['page'], text) for a in page_audits for text in a['unassigned']],
+                'rows_per_page': [(a['page'], a['rows']) for a in page_audits],
+            }
 
             return tables if tables else None
         except Exception:
@@ -1345,6 +1391,31 @@ def render_footer_validation(df: pd.DataFrame):
             f"Open Tablets {check['extracted_open']:,} (PDF: {check['pdf_open']:,})")
 
 
+def is_extraction_verified(df: Optional[pd.DataFrame]) -> bool:
+    """
+    True solo si la extracción por coordenadas es demostrablemente completa:
+    cuadra con el pie del PDF, sin discrepancias de integridad, con tantas filas
+    como albaranes en el texto del PDF y sin texto de la tabla sin asignar.
+    """
+    try:
+        if df is None or len(df) == 0:
+            return False
+
+        footer_check = check_pdf_footer_totals(df)
+        if footer_check is None or not footer_check['match']:
+            return False
+
+        audit = st.session_state.get('coordinate_audit')
+        if not audit or audit['slips_in_text'] != audit['rows'] or audit['rows'] != len(df):
+            return False
+        if audit['unassigned']:
+            return False
+
+        return len(validate_tablets_integrity(df)) == 0
+    except Exception:
+        return False
+
+
 def validate_tablets_integrity(df: pd.DataFrame, show_ui: bool = False,
                                full_df: Optional[pd.DataFrame] = None) -> List[Dict]:
     """
@@ -1394,6 +1465,399 @@ def validate_tablets_integrity(df: pd.DataFrame, show_ui: bool = False,
 
 
 # ============================================================================
+# CONTROL DE TABLILLAS: DETALLE, LISTA DE ACCIÓN, ANTIGÜEDAD, COMPARACIÓN Y CALIDAD
+# ============================================================================
+
+COLOR_CLOSED = '#2e9e5b'
+COLOR_OPEN = '#d64545'
+COLOR_WARN = '#f0a030'
+
+PRIORITY_ORDER = ['Crítico', 'Alto', 'Medio', 'Normal', 'Sin dato']
+PRIORITY_ICONS = {'Crítico': '🔴', 'Alto': '🟠', 'Medio': '🟡', 'Normal': '🟢', 'Sin dato': '⚪'}
+PRIORITY_FILLS = {'Crítico': 'F8D7DA', 'Alto': 'FDE2C8', 'Medio': 'FFF3CD', 'Normal': 'DFF0D8', 'Sin dato': 'EEEEEE'}
+
+AGING_BUCKETS = [
+    ('0-7 días', 0, 7, '#2e9e5b'),
+    ('8-14 días', 8, 14, '#d4c020'),
+    (f'15-{CRITICAL_DELAY_DAYS - 1} días', 15, CRITICAL_DELAY_DAYS - 1, '#f08030'),
+    (f'{CRITICAL_DELAY_DAYS}+ días (crítico)', CRITICAL_DELAY_DAYS, None, '#d64545'),
+]
+
+
+def prepare_named_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    DataFrame de análisis: 18 columnas con nombre, textos limpios y numéricos
+    (Total_Tablets / Open_Total con respaldo por conteo de códigos, delays numéricos).
+    Devuelve un DataFrame vacío si no tiene las 18 columnas.
+    """
+    if df is None or len(df.columns) < 18:
+        return pd.DataFrame()
+
+    raw = df.reset_index(drop=True)
+    named = to_named_df(raw)
+    for column in named.columns:
+        if column not in ('Total_Tablets', 'Open_Total', 'Counting_Delay', 'Validation_Delay'):
+            named[column] = named[column].map(clean_cell)
+
+    totals = row_tablet_totals(raw)
+    named['Total_Tablets'] = totals['total']
+    named['Open_Total'] = totals['abiertas']
+    named['Definitive'] = named['Definitive'].map(normalize_definitive)
+    named['Return_Prefix'] = named['Return_Prefix'].str.upper()
+    named['Wh'] = named['Wh'].str.upper()
+    named['Counting_Delay'] = pd.to_numeric(named['Counting_Delay'], errors='coerce')
+    named['Validation_Delay'] = pd.to_numeric(named['Validation_Delay'], errors='coerce')
+    return named
+
+
+def pending_mask(named: pd.DataFrame) -> pd.Series:
+    """Albaranes pendientes: con tablillas abiertas o aún no definitivos."""
+    return (named['Open_Total'] > 0) | (named['Definitive'] != 'Yes')
+
+
+def priority_label(delay) -> str:
+    """Prioridad según la demora de conteo (Counting_Delay)."""
+    value = pd.to_numeric(delay, errors='coerce')
+    if pd.isna(value):
+        return 'Sin dato'
+    if value >= CRITICAL_DELAY_DAYS:
+        return 'Crítico'
+    if value >= 15:
+        return 'Alto'
+    if value >= 8:
+        return 'Medio'
+    return 'Normal'
+
+
+def age_bucket(delay) -> str:
+    """Rango de antigüedad (días de demora) al que pertenece un albarán."""
+    value = pd.to_numeric(delay, errors='coerce')
+    if pd.isna(value):
+        return 'Sin dato'
+    for label, low, high, _ in AGING_BUCKETS:
+        if value >= low and (high is None or value <= high):
+            return label
+    return AGING_BUCKETS[0][0]
+
+
+def build_action_list(df: pd.DataFrame) -> pd.DataFrame:
+    """Albaranes pendientes ordenados por demora: a quién dar seguimiento primero."""
+    named = prepare_named_df(df)
+    if named.empty:
+        return pd.DataFrame()
+
+    pending = named[pending_mask(named)].copy()
+    if pending.empty:
+        return pd.DataFrame()
+
+    action = pd.DataFrame({
+        'Prioridad': pending['Counting_Delay'].map(priority_label),
+        'Return_Slip': pending['Return_Slip'],
+        'Wh': pending['Wh'],
+        'Warehouse': pending['Return_Prefix'],
+        'Cost_Center': pending['Cost_Center'],
+        'Customer': pending['Customer'],
+        'Job_Name': pending['Job_Name'],
+        'Return_Date': pending['Return_Date'],
+        'Counting_Delay': pending['Counting_Delay'],
+        'Validation_Delay': pending['Validation_Delay'],
+        'Total_Tablets': pending['Total_Tablets'],
+        'Open_Total': pending['Open_Total'],
+        'Open_Tablets': pending['Open_Tablets'],
+    })
+    action = action.sort_values(['Counting_Delay', 'Open_Total'], ascending=[False, False],
+                                na_position='last', kind='stable')
+    return action.reset_index(drop=True)
+
+
+def build_aging_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Albaranes pendientes y tablillas abiertas por rango de antigüedad."""
+    named = prepare_named_df(df)
+    labels = [b[0] for b in AGING_BUCKETS]
+    if named.empty:
+        return pd.DataFrame({'Rango': labels, 'Albaranes': 0, 'Tablillas_Abiertas': 0})
+
+    pending = named[pending_mask(named)].copy()
+    pending['Rango'] = pending['Counting_Delay'].map(age_bucket)
+    grouped = pending.groupby('Rango').agg(Albaranes=('Return_Slip', 'size'),
+                                           Tablillas_Abiertas=('Open_Total', 'sum'))
+
+    order = labels + (['Sin dato'] if 'Sin dato' in grouped.index else [])
+    summary = grouped.reindex(order, fill_value=0).reset_index()
+    summary.columns = ['Rango', 'Albaranes', 'Tablillas_Abiertas']
+    summary['Albaranes'] = summary['Albaranes'].astype(int)
+    summary['Tablillas_Abiertas'] = summary['Tablillas_Abiertas'].astype(int)
+    return summary
+
+
+def split_code_suffix(token: str) -> Tuple[str, str]:
+    """'1706A' -> ('1706', 'A'); '279' -> ('279', '')."""
+    match = re.fullmatch(r'(\d+)([A-Za-z]*)', token.strip())
+    return (match.group(1), match.group(2).upper()) if match else (token.strip(), '')
+
+
+def build_tablet_detail(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Una fila por tablilla de cada albarán. Estado 'Abierta' si el código aparece
+    en Open_Tablets (con su sufijo tal como viene en el PDF), si no 'Cerrada'.
+    """
+    named = prepare_named_df(df)
+    columns = ['Tablilla', 'Sufijo', 'Estado', 'Return_Slip', 'Wh', 'Warehouse', 'Cost_Center',
+               'Customer', 'Job_Name', 'Return_Date', 'Definitive', 'Counting_Delay', 'Nota']
+    if named.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for _, row in named.iterrows():
+        tablet_codes = [split_code_suffix(t)[0] for t in split_tablet_codes(row['Tablets'])
+                        if re.search(r'\d', t)]
+        open_suffix: Dict[str, str] = {}
+        for token in split_tablet_codes(row['Open_Tablets']):
+            if re.search(r'\d', token):
+                base, suffix = split_code_suffix(token)
+                open_suffix.setdefault(base, suffix)
+
+        common = {
+            'Return_Slip': row['Return_Slip'], 'Wh': row['Wh'], 'Warehouse': row['Return_Prefix'],
+            'Cost_Center': row['Cost_Center'], 'Customer': row['Customer'], 'Job_Name': row['Job_Name'],
+            'Return_Date': row['Return_Date'], 'Definitive': row['Definitive'],
+            'Counting_Delay': row['Counting_Delay'],
+        }
+        for code in tablet_codes:
+            is_open = code in open_suffix
+            rows.append({'Tablilla': code, 'Sufijo': open_suffix.get(code, ''),
+                         'Estado': 'Abierta' if is_open else 'Cerrada', 'Nota': '', **common})
+        for code, suffix in open_suffix.items():
+            if code not in tablet_codes:
+                rows.append({'Tablilla': code, 'Sufijo': suffix, 'Estado': 'Abierta',
+                             'Nota': 'Solo figura en Open_Tablets', **common})
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def search_albaranes(df: pd.DataFrame, query: str) -> Dict[str, pd.DataFrame]:
+    """
+    Busca por número de albarán (completo o parcial), código de tablilla (con o sin
+    sufijo) o texto en cliente / obra. Devuelve albaranes y tablillas coincidentes.
+    """
+    query = clean_cell(query)
+    named = prepare_named_df(df)
+    empty = {'albaranes': pd.DataFrame(), 'tablillas': pd.DataFrame()}
+    if not query or named.empty:
+        return empty
+
+    detail = build_tablet_detail(df)
+    lowered = query.lower()
+    base_query, _ = split_code_suffix(query)
+
+    slip_match = named['Return_Slip'].str.contains(re.escape(query), case=False, na=False)
+    text_match = (named['Customer'].str.lower().str.contains(re.escape(lowered), na=False)
+                  | named['Job_Name'].str.lower().str.contains(re.escape(lowered), na=False))
+
+    tablet_match = pd.Series(False, index=detail.index)
+    if base_query.isdigit() and not detail.empty:
+        tablet_match = detail['Tablilla'] == base_query
+        if re.fullmatch(r'\d+[A-Za-z]+', query):
+            tablet_match &= detail['Sufijo'].str.upper() == split_code_suffix(query)[1]
+
+    matched_slips = set(named.loc[slip_match | text_match, 'Return_Slip'])
+    if not detail.empty:
+        matched_slips |= set(detail.loc[tablet_match, 'Return_Slip'])
+
+    albaranes = named[named['Return_Slip'].isin(matched_slips)].copy()
+    tablets = detail[tablet_match].copy() if not detail.empty else detail
+    return {'albaranes': albaranes.reset_index(drop=True), 'tablillas': tablets.reset_index(drop=True)}
+
+
+def compare_snapshots(df_before: pd.DataFrame, df_after: pd.DataFrame) -> Dict:
+    """
+    Compara dos extracciones (anterior vs reciente) a nivel de albarán y de tablilla.
+
+    - nuevos: albaranes que aparecen solo en el reciente
+    - salieron: albaranes que estaban y ya no figuran en el reporte
+    - cerrados: pendientes antes y cerrados ahora
+    - siguen: pendientes en ambos (con variación de tablillas abiertas y demora)
+    - tablillas_cerradas / tablillas_salieron / tablillas_nuevas: cambios de tablillas abiertas
+    """
+    before = prepare_named_df(df_before).drop_duplicates('Return_Slip').set_index('Return_Slip')
+    after = prepare_named_df(df_after).drop_duplicates('Return_Slip').set_index('Return_Slip')
+    before['pendiente'] = pending_mask(before)
+    after['pendiente'] = pending_mask(after)
+
+    new_slips = after.index.difference(before.index)
+    gone_slips = before.index.difference(after.index)
+    common = before.index.intersection(after.index)
+
+    closed_slips = [s for s in common if before.at[s, 'pendiente'] and not after.at[s, 'pendiente']]
+    still_slips = [s for s in common if before.at[s, 'pendiente'] and after.at[s, 'pendiente']]
+
+    def describe(frame, slips, extra=None):
+        out = frame.loc[list(slips), ['Wh', 'Return_Prefix', 'Cost_Center', 'Customer', 'Job_Name',
+                                      'Definitive', 'Open_Total', 'Counting_Delay']].copy()
+        out.columns = ['Wh', 'Warehouse', 'Cost_Center', 'Customer', 'Job_Name', 'Definitive',
+                       'Open_Total', 'Counting_Delay']
+        if extra is not None:
+            for name, values in extra.items():
+                out[name] = values
+        return out.reset_index()
+
+    still = describe(after, still_slips, {
+        'Open_Antes': [int(before.at[s, 'Open_Total']) for s in still_slips],
+        'Delay_Antes': [before.at[s, 'Counting_Delay'] for s in still_slips],
+    })
+    if not still.empty:
+        still['Variación_Open'] = still['Open_Total'] - still['Open_Antes']
+        still = still.sort_values('Counting_Delay', ascending=False, na_position='last')
+
+    detail_before = build_tablet_detail(df_before)
+    detail_after = build_tablet_detail(df_after)
+
+    def open_keys(detail):
+        opened = detail[detail['Estado'] == 'Abierta']
+        return {(r.Return_Slip, r.Tablilla) for r in opened.itertuples()}
+
+    open_before, open_after = open_keys(detail_before), open_keys(detail_after)
+    slips_after = set(after.index)
+
+    def tablet_rows(keys, source):
+        wanted = detail_before if source == 'before' else detail_after
+        columns = ['Return_Slip', 'Tablilla', 'Sufijo', 'Customer', 'Job_Name']
+        if not keys or wanted.empty:
+            return pd.DataFrame(columns=columns)
+        in_keys = pd.Series([(a, b) in keys for a, b in zip(wanted['Return_Slip'], wanted['Tablilla'])],
+                            index=wanted.index)
+        subset = wanted[in_keys & (wanted['Estado'] == 'Abierta')]
+        return subset[columns].reset_index(drop=True)
+
+    closed_keys = {k for k in open_before - open_after if k[0] in slips_after}
+    gone_keys = {k for k in open_before - open_after if k[0] not in slips_after}
+    new_keys = open_after - open_before
+
+    return {
+        'resumen': {
+            'albaranes_antes': len(before), 'albaranes_despues': len(after),
+            'nuevos': len(new_slips), 'salieron': len(gone_slips),
+            'cerrados': len(closed_slips), 'siguen_pendientes': len(still_slips),
+            'tablillas_abiertas_antes': int(before['Open_Total'].sum()),
+            'tablillas_abiertas_despues': int(after['Open_Total'].sum()),
+            'tablillas_cerradas': len(closed_keys), 'tablillas_salieron': len(gone_keys),
+            'tablillas_nuevas_abiertas': len(new_keys),
+        },
+        'nuevos': describe(after, new_slips),
+        'salieron': describe(before, gone_slips),
+        'cerrados': describe(after, closed_slips),
+        'siguen': still,
+        'tablillas_cerradas': tablet_rows(closed_keys, 'before'),
+        'tablillas_salieron': tablet_rows(gone_keys, 'before'),
+        'tablillas_nuevas': tablet_rows(new_keys, 'after'),
+    }
+
+
+def build_data_quality_report(df: pd.DataFrame) -> List[Dict]:
+    """
+    Chequeos de calidad de la extracción. Cada chequeo devuelve:
+    Chequeo, Estado (OK / AVISO / ERROR), Cantidad, Detalle y Albaranes afectados.
+    """
+    checks: List[Dict] = []
+
+    def add(name: str, level: str, detail: str, slips: Optional[List[str]] = None):
+        slips = sorted(set(slips or []))
+        checks.append({'Chequeo': name, 'Estado': level, 'Cantidad': len(slips),
+                       'Detalle': detail, 'Albaranes': slips})
+
+    def flag(name: str, bad_slips: List[str], level: str, ok_text: str, bad_text: str):
+        if bad_slips:
+            add(name, level, bad_text, bad_slips)
+        else:
+            add(name, 'OK', ok_text)
+
+    named = prepare_named_df(df)
+    if named.empty:
+        add('Estructura', 'ERROR', 'La tabla no tiene las 18 columnas esperadas')
+        return checks
+    add('Estructura', 'OK', f'{len(named)} filas x 18 columnas')
+
+    slips = named['Return_Slip']
+    flag('Albaranes duplicados', sorted(set(slips[slips.duplicated(keep=False)])), 'ERROR',
+         'Cada albarán aparece una sola vez', 'Albaranes repetidos en la tabla')
+    flag('Formato de albarán', list(slips[~slips.str.fullmatch(r'7290000\d{5}')]), 'ERROR',
+         'Todos tienen formato 7290000XXXXX', 'Albaranes con formato inválido')
+
+    footer_check = check_pdf_footer_totals(df)
+    if footer_check is None:
+        add('Cuadratura con pie del PDF', 'AVISO', 'No se detectó la fila de totales del PDF; no se puede cuadrar')
+    elif footer_check['match']:
+        add('Cuadratura con pie del PDF', 'OK',
+            f"{footer_check['pdf_total']:,} Total Tablets | {footer_check['pdf_open']:,} Open Tablets coinciden")
+    else:
+        add('Cuadratura con pie del PDF', 'ERROR',
+            f"Extraído {footer_check['extracted_total']:,} / {footer_check['extracted_open']:,} "
+            f"vs PDF {footer_check['pdf_total']:,} / {footer_check['pdf_open']:,} (Total / Open)")
+
+    discrepancies = validate_tablets_integrity(df)
+    flag('Integridad de tablillas', [d['Slip'] for d in discrepancies], 'ERROR',
+         'Códigos de Tablets y Open_Tablets coinciden con sus totales',
+         'Cantidad de códigos distinta al total declarado')
+
+    audit = st.session_state.get('coordinate_audit')
+    if audit:
+        if audit['slips_in_text'] == audit['rows'] == len(df):
+            add('Filas vs albaranes en el PDF', 'OK',
+                f"{audit['rows']} filas = {audit['slips_in_text']} albaranes en el texto del PDF "
+                f"({audit['pages']} páginas)")
+        else:
+            add('Filas vs albaranes en el PDF', 'ERROR',
+                f"Filas {len(df)} / extraídas por coordenadas {audit['rows']} / "
+                f"albaranes en el texto del PDF {audit['slips_in_text']}")
+
+        if audit['unassigned']:
+            sample = ', '.join(f'p.{page}: {text}' for page, text in audit['unassigned'][:8])
+            add('Texto del PDF sin asignar', 'AVISO',
+                f"{len(audit['unassigned'])} palabras de la tabla no quedaron en ninguna fila ({sample})")
+        else:
+            add('Texto del PDF sin asignar', 'OK', 'Todo el texto de la tabla quedó asignado a una fila')
+    else:
+        add('Filas vs albaranes en el PDF', 'AVISO', 'Auditoría por coordenadas no disponible')
+
+    valid_definitive = named['Definitive'].isin(['Yes', 'No'])
+    flag('Valores de Definitive', list(slips[~valid_definitive]), 'ERROR',
+         'Todos son Yes o No', 'Definitive distinto de Yes / No')
+
+    def parse_dates(column):
+        return pd.to_datetime(named[column], format='%m/%d/%Y', errors='coerce')
+
+    return_dates, counted_dates = parse_dates('Return_Date'), parse_dates('Counted_Date')
+    invoice_dates = parse_dates('Invoice_Date2')
+    flag('Fecha de retorno', list(slips[return_dates.isna()]), 'AVISO',
+         'Todas las fechas de retorno son válidas', 'Return_Date vacía o inválida')
+    flag('Siguiente fecha de factura', list(slips[invoice_dates.isna()]), 'AVISO',
+         'Todas las fechas de factura son válidas', 'Invoice_Date2 vacía o inválida')
+
+    counted_text = named['Counted_Date'] != ''
+    flag('Fecha de conteo inválida', list(slips[counted_text & counted_dates.isna()]), 'AVISO',
+         'Las fechas de conteo informadas son válidas', 'Counted_Date con formato inválido')
+    flag('Definitive=Yes sin fecha de conteo', list(slips[(named['Definitive'] == 'Yes') & ~counted_text]),
+         'AVISO', 'Todos los definitivos tienen fecha de conteo', 'Yes sin Counted_Date')
+    flag('Definitive=No con fecha de conteo', list(slips[(named['Definitive'] == 'No') & counted_text]),
+         'AVISO', 'Ningún pendiente tiene fecha de conteo', 'No con Counted_Date informada')
+    flag('Conteo anterior al retorno', list(slips[counted_dates < return_dates]), 'AVISO',
+         'Las fechas de conteo son posteriores al retorno', 'Counted_Date anterior a Return_Date')
+
+    flag('Definitive=Yes con tablillas abiertas', list(slips[(named['Definitive'] == 'Yes') & (named['Open_Total'] > 0)]),
+         'AVISO', 'Los definitivos no tienen tablillas abiertas', 'Yes con Open_Total > 0')
+    flag('Abiertas mayores que el total', list(slips[named['Open_Total'] > named['Total_Tablets']]), 'ERROR',
+         'Open_Total nunca supera Total_Tablets', 'Open_Total mayor que Total_Tablets')
+
+    raw_delays = df.reset_index(drop=True).iloc[:, [16, 17]].apply(lambda col: col.map(clean_cell))
+    bad_delay = (pd.to_numeric(raw_delays.iloc[:, 0], errors='coerce').isna()
+                 | pd.to_numeric(raw_delays.iloc[:, 1], errors='coerce').isna())
+    flag('Demoras numéricas', list(slips[bad_delay]), 'AVISO',
+         'Counting_Delay y Validation_Delay son numéricos', 'Demora vacía o no numérica')
+
+    return checks
+
+
+# ============================================================================
 # EXPORTACIÓN EXCEL PROFESIONAL CON MÚLTIPLES HOJAS
 # ============================================================================
 
@@ -1431,6 +1895,25 @@ def _format_excel_sheet(ws, totals_row: bool = False, autofilter: bool = False):
             cell.border = Border(top=Side(style='medium', color='1F4E78'), bottom=thin)
 
 
+def _color_excel_column(ws, header: str, fills: Dict[str, str], whole_row: bool = False):
+    """Colorea las celdas (o la fila completa) según el valor de la columna `header`."""
+    from openpyxl.styles import PatternFill
+
+    headers = [cell.value for cell in ws[1]]
+    if header not in headers:
+        return
+    col_idx = headers.index(header) + 1
+
+    for row in range(2, ws.max_row + 1):
+        color = fills.get(str(ws.cell(row=row, column=col_idx).value))
+        if not color:
+            continue
+        fill = PatternFill('solid', start_color=color, end_color=color)
+        cells = ws[row] if whole_row else [ws.cell(row=row, column=col_idx)]
+        for cell in cells:
+            cell.fill = fill
+
+
 def _with_totals_row(summary_df: pd.DataFrame, label_col: str, sum_cols: List[str],
                      overrides: Optional[Dict] = None) -> pd.DataFrame:
     """Agrega una fila 'TOTAL' con la suma de sum_cols y valores explícitos en overrides."""
@@ -1456,6 +1939,7 @@ def export_to_professional_excel(df: pd.DataFrame) -> io.BytesIO:
     try:
         buffer = io.BytesIO()
         totals_sheets = set()
+        priority_sheets = set()
 
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
 
@@ -1517,10 +2001,34 @@ def export_to_professional_excel(df: pd.DataFrame) -> io.BytesIO:
                 disc_df = pd.DataFrame(discrepancies)
                 disc_df.to_excel(writer, sheet_name='Discrepancias', index=False)
 
+            action_df = build_action_list(df)
+            if not action_df.empty:
+                action_df.to_excel(writer, sheet_name='Lista_Accion', index=False)
+                priority_sheets.add('Lista_Accion')
+
+            tablet_detail = build_tablet_detail(df)
+            if not tablet_detail.empty:
+                tablet_detail.to_excel(writer, sheet_name='Detalle_Tablillas', index=False)
+
+            quality_df = pd.DataFrame([
+                {**{k: v for k, v in check.items() if k != 'Albaranes'},
+                 'Albaranes': ', '.join(check['Albaranes'][:60]) + (' ...' if len(check['Albaranes']) > 60 else '')}
+                for check in build_data_quality_report(df)
+            ])
+            quality_df.to_excel(writer, sheet_name='Calidad_Datos', index=False)
+
             for sheet_name, worksheet in writer.sheets.items():
                 _format_excel_sheet(worksheet,
                                     totals_row=sheet_name in totals_sheets,
-                                    autofilter=sheet_name == 'Datos_Principales')
+                                    autofilter=sheet_name in ('Datos_Principales', 'Lista_Accion',
+                                                              'Detalle_Tablillas'))
+                if sheet_name in priority_sheets:
+                    _color_excel_column(worksheet, 'Prioridad', PRIORITY_FILLS, whole_row=True)
+                if sheet_name == 'Detalle_Tablillas':
+                    _color_excel_column(worksheet, 'Estado', {'Abierta': 'F8D7DA', 'Cerrada': 'DFF0D8'})
+                if sheet_name == 'Calidad_Datos':
+                    _color_excel_column(worksheet, 'Estado',
+                                        {'OK': 'DFF0D8', 'AVISO': 'FFF3CD', 'ERROR': 'F8D7DA'})
 
         buffer.seek(0)
         return buffer
@@ -1528,6 +2036,80 @@ def export_to_professional_excel(df: pd.DataFrame) -> io.BytesIO:
     except Exception as e:
         st.error(f"Error creando Excel profesional: {e}")
         return None
+
+
+# ============================================================================
+# GRÁFICOS REUTILIZABLES
+# ============================================================================
+
+def create_progress_bar(closed: int, open_: int, target: float = 80.0, title: str = "") -> go.Figure:
+    """Barra única de avance: % cerradas vs abiertas con la meta marcada."""
+    total = closed + open_
+    closed_pct = (closed / total * 100) if total else 0
+    open_pct = 100 - closed_pct if total else 0
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=[''], x=[closed_pct], orientation='h', name='Cerradas', marker_color=COLOR_CLOSED,
+        text=[f"{closed:,} cerradas · {closed_pct:.1f}%"], textposition='inside',
+        insidetextanchor='middle', hovertemplate="Cerradas: %{x:.1f}%<extra></extra>"))
+    fig.add_trace(go.Bar(
+        y=[''], x=[open_pct], orientation='h', name='Abiertas', marker_color=COLOR_OPEN,
+        text=[f"{open_:,} abiertas · {open_pct:.1f}%"], textposition='inside',
+        insidetextanchor='middle', hovertemplate="Abiertas: %{x:.1f}%<extra></extra>"))
+    fig.add_vline(x=target, line_dash='dash', line_color=COLOR_WARN, line_width=3,
+                  annotation_text=f"Meta {target:.0f}%", annotation_position='top')
+    fig.update_layout(barmode='stack', title=title, height=190, showlegend=False,
+                      xaxis=dict(range=[0, 100], ticksuffix='%'), yaxis=dict(visible=False),
+                      margin=dict(l=10, r=10, t=60, b=30))
+    return fig
+
+
+def create_status_stacked_bar(summary: pd.DataFrame, label_col: str, closed_col: str,
+                              open_col: str, title: str) -> go.Figure:
+    """
+    Barras horizontales al 100% (cerradas vs abiertas) por categoría. El nombre de
+    cada barra incluye el % de abiertas y las categorías con más abiertas van arriba.
+    """
+    data = summary.copy()
+    total = (data[closed_col] + data[open_col]).replace(0, np.nan)
+    data['open_pct'] = (data[open_col] / total * 100).fillna(0)
+    data = data.sort_values(['open_pct', open_col], ascending=False)
+    labels = [f"{name}  ·  {pct:.0f}% abiertas" for name, pct in zip(data[label_col], data['open_pct'])]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=labels, x=data[closed_col], orientation='h', name='Cerradas', marker_color=COLOR_CLOSED,
+        text=data[closed_col], textposition='inside',
+        hovertemplate="%{y}<br>Cerradas: %{x}<extra></extra>"))
+    fig.add_trace(go.Bar(
+        y=labels, x=data[open_col], orientation='h', name='Abiertas', marker_color=COLOR_OPEN,
+        text=data[open_col], textposition='inside',
+        hovertemplate="%{y}<br>Abiertas: %{x}<extra></extra>"))
+    fig.update_layout(
+        barmode='stack', barnorm='percent', title=title,
+        xaxis=dict(ticksuffix='%', range=[0, 100]),
+        yaxis=dict(autorange='reversed'),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        height=max(220, 55 * len(data) + 120), margin=dict(l=10, r=10, t=70, b=30))
+    return fig
+
+
+def create_aging_chart(summary: pd.DataFrame) -> go.Figure:
+    """Tablillas abiertas por rango de antigüedad, de verde (reciente) a rojo (crítico)."""
+    colors = {label: color for label, _, _, color in AGING_BUCKETS}
+    bar_colors = [colors.get(label, '#888888') for label in summary['Rango']]
+
+    fig = go.Figure(go.Bar(
+        x=summary['Rango'], y=summary['Tablillas_Abiertas'], marker_color=bar_colors,
+        text=[f"{t} tablillas<br>{a} albaranes" for t, a in zip(summary['Tablillas_Abiertas'], summary['Albaranes'])],
+        textposition='outside', cliponaxis=False,
+        hovertemplate="%{x}<br>%{y} tablillas abiertas<extra></extra>"))
+    fig.update_layout(title="Antigüedad de las tablillas abiertas (días de demora de conteo)",
+                      yaxis_title="Tablillas abiertas", xaxis_title="Demora",
+                      height=420, margin=dict(t=70))
+    fig.update_yaxes(range=[0, max(summary['Tablillas_Abiertas'].max() * 1.3, 1)])
+    return fig
 
 
 # ============================================================================
@@ -1569,52 +2151,11 @@ def create_tablets_dashboard(df: pd.DataFrame, full_df: Optional[pd.DataFrame] =
                 st.metric("Estado", "🔴 ATENCIÓN",
                          help="Tasa de cierre inferior al 70%")
 
-        st.subheader("📊 Distribución Visual")
-        col1, col2 = st.columns(2)
-
-        with col1:
-            fig_pie = go.Figure(data=[go.Pie(
-                labels=['Cerradas', 'Abiertas'],
-                values=[metrics['cerradas'], metrics['abiertas']],
-                hole=0.4,
-                marker=dict(colors=['#28a745', '#dc3545']),
-                textinfo='label+percent',
-                textposition='auto'
-            )])
-            fig_pie.update_layout(
-                title="Estado de Tablillas",
-                annotations=[dict(
-                    text=f"{metrics['total']:,}<br>Total",
-                    x=0.5, y=0.5,
-                    font_size=20,
-                    showarrow=False
-                )],
-                showlegend=True
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        with col2:
-            fig_gauge = go.Figure(go.Indicator(
-                mode="gauge+number+delta",
-                value=metrics['tasa_cierre'],
-                title={'text': "Tasa de Cierre (%)"},
-                delta={'reference': 80, 'increasing': {'color': "green"}},
-                gauge={
-                    'axis': {'range': [None, 100]},
-                    'bar': {'color': "#1f77b4"},
-                    'steps': [
-                        {'range': [0, 70], 'color': "#ffcccc"},
-                        {'range': [70, 80], 'color': "#fff4cc"},
-                        {'range': [80, 100], 'color': "#ccffcc"}
-                    ],
-                    'threshold': {
-                        'line': {'color': "red", 'width': 4},
-                        'thickness': 0.75,
-                        'value': 80
-                    }
-                }
-            ))
-            st.plotly_chart(fig_gauge, use_container_width=True)
+        st.subheader("📊 Avance de Cierre")
+        st.plotly_chart(
+            create_progress_bar(metrics['cerradas'], metrics['abiertas'], target=80.0,
+                                title=f"{metrics['total']:,} tablillas en total"),
+            use_container_width=True)
 
         st.subheader("🏭 Análisis por Warehouse")
         warehouse_df = create_tablets_breakdown_by_warehouse(df)
@@ -1623,36 +2164,27 @@ def create_tablets_dashboard(df: pd.DataFrame, full_df: Optional[pd.DataFrame] =
             col1, col2 = st.columns([2, 1])
 
             with col1:
-                fig_bar = go.Figure()
-                fig_bar.add_trace(go.Bar(
-                    name='Cerradas',
-                    x=warehouse_df['Warehouse'],
-                    y=warehouse_df['Cerradas'],
-                    marker_color='#28a745',
-                    text=warehouse_df['Cerradas'],
-                    textposition='inside'
-                ))
-                fig_bar.add_trace(go.Bar(
-                    name='Abiertas',
-                    x=warehouse_df['Warehouse'],
-                    y=warehouse_df['Abiertas'],
-                    marker_color='#dc3545',
-                    text=warehouse_df['Abiertas'],
-                    textposition='inside'
-                ))
-                fig_bar.update_layout(
-                    title="Distribución por Warehouse",
-                    barmode='stack',
-                    xaxis_title="Warehouse",
-                    yaxis_title="Cantidad de Tablillas",
-                    showlegend=True,
-                    hovermode='x unified'
-                )
-                st.plotly_chart(fig_bar, use_container_width=True)
+                st.plotly_chart(
+                    create_status_stacked_bar(warehouse_df, 'Warehouse', 'Cerradas', 'Abiertas',
+                                              "Tablillas cerradas vs abiertas por Warehouse"),
+                    use_container_width=True)
 
             with col2:
                 st.markdown("**📋 Detalle por Warehouse**")
-                st.dataframe(warehouse_df, use_container_width=True, height=300)
+                st.dataframe(warehouse_df, use_container_width=True, height=300, hide_index=True)
+
+        st.subheader("🏗️ Análisis por Cost Center")
+        cost_center_df = build_cost_center_summary(BusinessAnalyzer().parse_dataframe(df))
+        if not cost_center_df.empty:
+            cost_tablets = pd.DataFrame({
+                'Cost Center': cost_center_df['Cost Center'],
+                'Cerradas': cost_center_df['Total Tablets'] - cost_center_df['Open Tablets'],
+                'Abiertas': cost_center_df['Open Tablets'],
+            })
+            st.plotly_chart(
+                create_status_stacked_bar(cost_tablets, 'Cost Center', 'Cerradas', 'Abiertas',
+                                          "Tablillas cerradas vs abiertas por Cost Center"),
+                use_container_width=True)
 
         st.subheader("🏢 Top Clientes con Tablillas Abiertas")
         customer_df = create_tablets_by_customer(df)
@@ -1800,7 +2332,8 @@ def create_analysis_dashboard(df: pd.DataFrame):
                       f"{avg_validation_delay:.1f}" if pd.notna(avg_validation_delay) else "N/D")
         with col3:
             st.metric("Albaranes Críticos", critical_albaranes,
-                      help=f"Albaranes con Counting Delay ≥ {CRITICAL_DELAY_DAYS} días")
+                      help=f"Todos los albaranes con Counting Delay ≥ {CRITICAL_DELAY_DAYS} días, "
+                           f"incluidos los ya cerrados. Los pendientes críticos están en Control de Tablillas.")
 
         st.subheader("🏭 Performance por Warehouse")
 
@@ -1828,14 +2361,10 @@ def create_analysis_dashboard(df: pd.DataFrame):
             warehouse_df = pd.DataFrame(warehouse_stats)
             st.dataframe(warehouse_df, use_container_width=True)
 
-            fig = px.bar(
-                warehouse_df,
-                x='Warehouse',
-                y=['Cerrados', 'Pendientes'],
-                title="Distribución de Albaranes por Warehouse",
-                color_discrete_map={'Cerrados': '#28a745', 'Pendientes': '#dc3545'}
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(
+                create_status_stacked_bar(warehouse_df, 'Warehouse', 'Cerrados', 'Pendientes',
+                                          "Albaranes cerrados vs pendientes por Warehouse"),
+                use_container_width=True)
 
         st.subheader("🏗️ Performance por Cost Center")
         cost_center_df = build_cost_center_summary(analysis_df)
@@ -1847,24 +2376,49 @@ def create_analysis_dashboard(df: pd.DataFrame):
                         'Promedio Counting Delay', format="%.1f")
                 })
 
-            fig_cc = make_subplots(specs=[[{"secondary_y": True}]])
-            bar_series = [('Albaranes Totales', '#1f77b4'), ('Cerrados', '#28a745'),
-                          ('Pendientes', '#dc3545'), ('Total Tablets', '#9467bd'),
-                          ('Open Tablets', '#ff7f0e')]
-            for column, color in bar_series:
-                fig_cc.add_trace(go.Bar(name=column, x=cost_center_df['Cost Center'],
-                                        y=cost_center_df[column], marker_color=color),
-                                 secondary_y=False)
-            fig_cc.add_trace(go.Scatter(
-                name='Promedio Counting Delay (días)', x=cost_center_df['Cost Center'],
-                y=cost_center_df['Promedio Counting Delay'], mode='lines+markers',
-                line=dict(color='#333333', width=2), marker=dict(size=8)),
-                secondary_y=True)
-            fig_cc.update_layout(title="Albaranes, Tablillas y Demora por Cost Center",
-                                 barmode='group', hovermode='x unified', height=500)
-            fig_cc.update_yaxes(title_text="Cantidad", secondary_y=False)
-            fig_cc.update_yaxes(title_text="Counting Delay (días)", secondary_y=True)
-            st.plotly_chart(fig_cc, use_container_width=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.plotly_chart(
+                    create_status_stacked_bar(cost_center_df, 'Cost Center', 'Cerrados', 'Pendientes',
+                                              "Albaranes cerrados vs pendientes"),
+                    use_container_width=True)
+            with col2:
+                delay_df = cost_center_df.sort_values('Promedio Counting Delay', ascending=False)
+                delay_colors = [COLOR_OPEN if (pd.notna(v) and v >= CRITICAL_DELAY_DAYS) else COLOR_WARN
+                                for v in delay_df['Promedio Counting Delay']]
+                fig_delay = go.Figure(go.Bar(
+                    y=delay_df['Cost Center'], x=delay_df['Promedio Counting Delay'], orientation='h',
+                    marker_color=delay_colors, text=delay_df['Promedio Counting Delay'],
+                    textposition='outside', cliponaxis=False,
+                    hovertemplate="%{y}<br>%{x} días promedio<extra></extra>"))
+                fig_delay.add_vline(x=CRITICAL_DELAY_DAYS, line_dash='dash', line_color=COLOR_OPEN,
+                                    annotation_text=f"Crítico {CRITICAL_DELAY_DAYS} d",
+                                    annotation_position='top')
+                fig_delay.update_layout(title="Demora promedio de conteo (días)",
+                                        yaxis=dict(autorange='reversed'),
+                                        height=max(220, 55 * len(delay_df) + 120),
+                                        margin=dict(l=10, r=40, t=70, b=30))
+                st.plotly_chart(fig_delay, use_container_width=True)
+
+            with st.expander("📊 Comparativa completa por Cost Center (barras agrupadas)"):
+                fig_cc = make_subplots(specs=[[{"secondary_y": True}]])
+                bar_series = [('Albaranes Totales', '#1f77b4'), ('Cerrados', COLOR_CLOSED),
+                              ('Pendientes', COLOR_OPEN), ('Total Tablets', '#9467bd'),
+                              ('Open Tablets', '#ff7f0e')]
+                for column, color in bar_series:
+                    fig_cc.add_trace(go.Bar(name=column, x=cost_center_df['Cost Center'],
+                                            y=cost_center_df[column], marker_color=color),
+                                     secondary_y=False)
+                fig_cc.add_trace(go.Scatter(
+                    name='Promedio Counting Delay (días)', x=cost_center_df['Cost Center'],
+                    y=cost_center_df['Promedio Counting Delay'], mode='lines+markers',
+                    line=dict(color='#888888', width=2), marker=dict(size=8)),
+                    secondary_y=True)
+                fig_cc.update_layout(title="Albaranes, Tablillas y Demora por Cost Center",
+                                     barmode='group', hovermode='x unified', height=500)
+                fig_cc.update_yaxes(title_text="Cantidad", secondary_y=False)
+                fig_cc.update_yaxes(title_text="Counting Delay (días)", secondary_y=True)
+                st.plotly_chart(fig_cc, use_container_width=True)
         else:
             st.info("No hay datos de Cost Center para mostrar")
 
@@ -2091,6 +2645,11 @@ def create_historical_dashboard():
             st.subheader("📋 Resumen Histórico")
             st.dataframe(tablets_df, use_container_width=True)
 
+            comparable = {}
+            for frame in sorted(all_data, key=lambda f: (f['fecha_archivo'].iloc[0], f['nombre_archivo'].iloc[0])):
+                comparable[frame['nombre_archivo'].iloc[0]] = frame.iloc[:, :18].copy()
+            render_snapshot_comparison(comparable)
+
             # ============================================================
             # EXPORTACIÓN
             # ============================================================
@@ -2121,6 +2680,238 @@ def create_historical_dashboard():
             )
     else:
         st.warning("👆 Sube archivos Excel para comenzar")
+
+
+# ============================================================================
+# PANEL DE CALIDAD Y PESTAÑA DE CONTROL DE TABLILLAS
+# ============================================================================
+
+QUALITY_ICONS = {'OK': '✅', 'AVISO': '⚠️', 'ERROR': '❌'}
+
+
+def render_data_quality_panel(df: pd.DataFrame):
+    """Panel de calidad de la extracción: resumen, tabla de chequeos y albaranes afectados."""
+    checks = build_data_quality_report(df)
+    errors = [c for c in checks if c['Estado'] == 'ERROR']
+    warnings_ = [c for c in checks if c['Estado'] == 'AVISO']
+
+    st.subheader("🩺 Calidad de la Extracción")
+    if errors:
+        st.error(f"❌ {len(errors)} chequeo(s) con ERROR: revisa el detalle antes de usar estos datos")
+    elif warnings_:
+        st.warning(f"⚠️ Extracción cuadrada, con {len(warnings_)} aviso(s) para revisar")
+    else:
+        st.success(f"✅ Extracción verificada: {len(checks)} chequeos correctos")
+
+    with st.expander("Ver los chequeos de calidad", expanded=bool(errors or warnings_)):
+        table = pd.DataFrame([{
+            'Estado': f"{QUALITY_ICONS[c['Estado']]} {c['Estado']}",
+            'Chequeo': c['Chequeo'],
+            'Detalle': c['Detalle'],
+            'Albaranes afectados': c['Cantidad'],
+        } for c in checks])
+        st.dataframe(table, use_container_width=True, hide_index=True)
+
+        for check in checks:
+            if check['Albaranes']:
+                st.markdown(f"**{check['Chequeo']}**: " + ', '.join(check['Albaranes'][:40])
+                            + (' ...' if len(check['Albaranes']) > 40 else ''))
+
+        audit = st.session_state.get('coordinate_audit')
+        if audit:
+            per_page = pd.DataFrame(audit['rows_per_page'], columns=['Página', 'Filas'])
+            st.markdown("**Filas extraídas por página**")
+            st.dataframe(per_page.set_index('Página').T, use_container_width=True)
+
+
+def _priority_styler(table: pd.DataFrame, priority_col: str = 'Prioridad'):
+    """Colorea cada fila según su prioridad (texto oscuro para ser legible en tema oscuro)."""
+    def paint(row):
+        label = str(row[priority_col]).split(' ', 1)[-1]
+        color = PRIORITY_FILLS.get(label, 'FFFFFF')
+        return [f'background-color: #{color}; color: #212529'] * len(row)
+    return table.style.apply(paint, axis=1)
+
+
+def _csv_button(label: str, table: pd.DataFrame, filename: str, key: str):
+    """Botón de descarga CSV (UTF-8 con BOM para que Excel respete los acentos)."""
+    st.download_button(label, table.to_csv(index=False).encode('utf-8-sig'), filename,
+                       'text/csv', key=key)
+
+
+def create_tablet_control_tab(df: pd.DataFrame, full_df: pd.DataFrame):
+    """
+    Control de tablillas: buscador, lista de acción, antigüedad y detalle por tablilla.
+    df = datos con los filtros globales; full_df = PDF completo (para el buscador).
+    """
+    st.header("🎯 Control de Tablillas")
+    st.markdown("**Qué está pendiente, hace cuánto y en qué obra.**")
+
+    try:
+        st.subheader("🔎 Buscador")
+        query = st.text_input(
+            "Albarán, código de tablilla o texto de cliente / obra",
+            placeholder="Ej.: 729000021080, 1706, 1706A o Phorcys",
+            key='control_search')
+
+        if query.strip():
+            found = search_albaranes(full_df, query)
+            albaranes, tablets = found['albaranes'], found['tablillas']
+            if albaranes.empty:
+                st.info("Sin resultados para esa búsqueda (se busca en todo el PDF, sin filtros)")
+            else:
+                st.success(f"{len(albaranes)} albarán(es) y {len(tablets)} tablilla(s) coinciden")
+                view = albaranes[['Return_Slip', 'Wh', 'Return_Prefix', 'Cost_Center', 'Customer', 'Job_Name',
+                                  'Return_Date', 'Definitive', 'Counting_Delay', 'Total_Tablets',
+                                  'Open_Total', 'Tablets', 'Open_Tablets']]
+                st.dataframe(view, use_container_width=True, hide_index=True)
+                if not tablets.empty:
+                    st.markdown("**Tablillas que coinciden con el código buscado**")
+                    st.dataframe(tablets, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("📋 Lista de Acción: albaranes pendientes")
+        action_df = build_action_list(df)
+
+        if action_df.empty:
+            st.success("✅ No hay albaranes pendientes con los filtros actuales")
+        else:
+            critical = int((action_df['Prioridad'] == 'Crítico').sum())
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Albaranes pendientes", len(action_df))
+            col2.metric("Críticos pendientes", critical, help=f"Pendientes con Counting Delay ≥ {CRITICAL_DELAY_DAYS} días")
+            col3.metric("Tablillas abiertas", int(action_df['Open_Total'].sum()))
+            col4.metric("Mayor demora (días)", int(action_df['Counting_Delay'].max())
+                        if action_df['Counting_Delay'].notna().any() else 0)
+
+            present = [p for p in PRIORITY_ORDER if p in set(action_df['Prioridad'])]
+            chosen = st.multiselect("Prioridad", present, default=present, key='control_priority')
+            shown = action_df[action_df['Prioridad'].isin(chosen)].copy()
+            shown['Prioridad'] = shown['Prioridad'].map(lambda p: f"{PRIORITY_ICONS[p]} {p}")
+
+            st.dataframe(
+                _priority_styler(shown), use_container_width=True, hide_index=True, height=420,
+                column_config={
+                    'Counting_Delay': st.column_config.NumberColumn('Counting_Delay', format="%d"),
+                    'Validation_Delay': st.column_config.NumberColumn('Validation_Delay', format="%d"),
+                    'Total_Tablets': st.column_config.NumberColumn('Total_Tablets', format="%d"),
+                    'Open_Total': st.column_config.NumberColumn('Open_Total', format="%d"),
+                })
+            st.caption("Ordenada por mayor demora de conteo. "
+                       "🔴 ≥ 20 días · 🟠 15-19 · 🟡 8-14 · 🟢 menos de 8")
+            _csv_button("📥 Descargar lista de acción (CSV)", shown.assign(
+                Prioridad=shown['Prioridad'].str.split(' ', n=1).str[-1]),
+                f"lista_accion_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", 'dl_action')
+
+        st.divider()
+        st.subheader("⏳ Antigüedad de las Tablillas Abiertas")
+        aging = build_aging_summary(df)
+        if aging['Tablillas_Abiertas'].sum() == 0:
+            st.info("No hay tablillas abiertas con los filtros actuales")
+        else:
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.plotly_chart(create_aging_chart(aging), use_container_width=True)
+            with col2:
+                st.markdown("**Detalle por rango**")
+                st.dataframe(aging, use_container_width=True, hide_index=True)
+                st.caption("La demora es el Counting Delay que informa el PDF para cada albarán.")
+
+        st.divider()
+        st.subheader("🧾 Detalle por Tablilla")
+        detail = build_tablet_detail(df)
+        if detail.empty:
+            st.info("No hay tablillas para mostrar")
+        else:
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                state_choice = st.radio("Estado", ['Todas', 'Abierta', 'Cerrada'], horizontal=True,
+                                        key='detail_state')
+            suffixes = sorted(s for s in detail['Sufijo'].unique() if s)
+            with col2:
+                chosen_suffix = st.multiselect("Sufijo (letra al final del código abierto)", suffixes,
+                                               key='detail_suffix', placeholder="Todos")
+
+            view = detail
+            if state_choice != 'Todas':
+                view = view[view['Estado'] == state_choice]
+            if chosen_suffix:
+                view = view[view['Sufijo'].isin(chosen_suffix)]
+
+            st.caption(f"{len(view):,} tablilla(s) · {int((view['Estado'] == 'Abierta').sum()):,} abiertas")
+            st.dataframe(view, use_container_width=True, hide_index=True, height=420,
+                         column_config={'Counting_Delay': st.column_config.NumberColumn(
+                             'Counting_Delay', format="%d")})
+            _csv_button("📥 Descargar detalle por tablilla (CSV)", view,
+                        f"detalle_tablillas_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", 'dl_detail')
+
+    except Exception as e:
+        st.error(f"Error creando el control de tablillas: {e}")
+        import traceback
+        st.error(traceback.format_exc())
+
+
+def render_snapshot_comparison(files: Dict[str, pd.DataFrame]):
+    """Compara dos archivos históricos: qué se cerró, qué es nuevo y qué sigue pendiente."""
+    st.subheader("🔁 Comparación entre dos archivos")
+    names = list(files.keys())
+    if len(names) < 2:
+        st.info("Carga al menos dos archivos para compararlos")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        before_name = st.selectbox("Archivo anterior", names, index=len(names) - 2, key='cmp_before')
+    with col2:
+        after_name = st.selectbox("Archivo reciente", names, index=len(names) - 1, key='cmp_after')
+
+    if before_name == after_name:
+        st.warning("Selecciona dos archivos distintos")
+        return
+
+    try:
+        result = compare_snapshots(files[before_name], files[after_name])
+    except Exception as e:
+        st.error(f"No se pudo comparar: {e}")
+        return
+
+    summary = result['resumen']
+    open_delta = summary['tablillas_abiertas_despues'] - summary['tablillas_abiertas_antes']
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Tablillas abiertas", f"{summary['tablillas_abiertas_despues']:,}",
+                delta=f"{open_delta:+,}", delta_color="inverse",
+                help=f"Antes: {summary['tablillas_abiertas_antes']:,}")
+    col2.metric("Tablillas cerradas entre fechas", summary['tablillas_cerradas'])
+    col3.metric("Albaranes cerrados", summary['cerrados'])
+    col4.metric("Siguen pendientes", summary['siguen_pendientes'])
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Albaranes nuevos", summary['nuevos'])
+    col2.metric("Salieron del reporte", summary['salieron'],
+                help="Estaban en el archivo anterior y ya no figuran en el reciente")
+    col3.metric("Tablillas nuevas abiertas", summary['tablillas_nuevas_abiertas'])
+
+    labels = ['Cerrados', 'Siguen pendientes', 'Nuevos', 'Salieron del reporte']
+    values = [summary['cerrados'], summary['siguen_pendientes'], summary['nuevos'], summary['salieron']]
+    fig = go.Figure(go.Bar(
+        y=labels, x=values, orientation='h', text=values, textposition='outside', cliponaxis=False,
+        marker_color=[COLOR_CLOSED, COLOR_OPEN, '#1f77b4', '#888888']))
+    fig.update_layout(title="Qué pasó con los albaranes", yaxis=dict(autorange='reversed'),
+                      height=300, margin=dict(l=10, r=40, t=60, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    tabs = st.tabs(["✅ Cerrados", "⏳ Siguen pendientes", "🆕 Nuevos", "🚪 Salieron",
+                    "🔖 Tablillas cerradas", "🔖 Tablillas nuevas"])
+    sections = [(tabs[0], result['cerrados']), (tabs[1], result['siguen']), (tabs[2], result['nuevos']),
+                (tabs[3], result['salieron']), (tabs[4], result['tablillas_cerradas']),
+                (tabs[5], result['tablillas_nuevas'])]
+    for tab, table in sections:
+        with tab:
+            if table.empty:
+                st.info("Sin registros")
+            else:
+                st.dataframe(table, use_container_width=True, hide_index=True)
 
 
 # ============================================================================
@@ -2244,10 +3035,10 @@ def render_interactive_table(df: pd.DataFrame):
 # APLICACIÓN PRINCIPAL
 # ============================================================================
 
-def run_extraction_cached(uploaded_file, extractor: 'CamelotExtractorPro') -> Dict:
-    """Extrae el PDF una sola vez por archivo (los filtros provocan reruns de Streamlit)."""
+def run_extraction_cached(uploaded_file, extractor: 'CamelotExtractorPro', run_all: bool = False) -> Dict:
+    """Extrae el PDF una sola vez por archivo y modo (los filtros provocan reruns de Streamlit)."""
     file_bytes = uploaded_file.getvalue()
-    file_key = hashlib.md5(file_bytes).hexdigest()
+    file_key = f"{hashlib.md5(file_bytes).hexdigest()}:{'all' if run_all else 'fast'}"
 
     if st.session_state.get('extraction_key') != file_key:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
@@ -2256,7 +3047,7 @@ def run_extraction_cached(uploaded_file, extractor: 'CamelotExtractorPro') -> Di
 
         try:
             st.header("📄 Ejecutando Extracción")
-            results = extractor.extract_with_all_methods(tmp_path)
+            results = extractor.extract_with_all_methods(tmp_path, run_all=run_all)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -2265,6 +3056,7 @@ def run_extraction_cached(uploaded_file, extractor: 'CamelotExtractorPro') -> Di
 
         st.session_state['extraction_results'] = results
         st.session_state['extraction_key'] = file_key
+        st.session_state.pop('excel_export', None)
 
     return st.session_state['extraction_results']
 
@@ -2276,6 +3068,7 @@ def main():
         "📄 Extracción PDF",
         "📊 Análisis de Albaranes",
         "📦 Dashboard de Tablillas",
+        "🎯 Control de Tablillas",
         "📈 Análisis Histórico"
     ])
 
@@ -2289,16 +3082,22 @@ def main():
             - ✅ Extracción por coordenadas exactas (18 columnas)
             - ✅ Cuadratura contra el pie de página del PDF
             - ✅ Validación de integridad Total/Open
+            - ✅ Panel de calidad de la extracción
+            - ✅ Control de tablillas: lista de acción, antigüedad, buscador
             - ✅ Filtros globales en vivo
             - ✅ Demoras y Cost Center
             - ✅ Excel con múltiples hojas
-            - ✅ Análisis histórico avanzado
+            - ✅ Comparación entre fechas
             """)
 
             st.divider()
 
             st.markdown("**🔧 Opciones**")
             show_debug = st.checkbox("Modo Debug", value=False)
+            run_all_methods = st.checkbox(
+                "Comparar con todos los métodos (más lento)", value=False,
+                help="Por defecto los métodos de respaldo de Camelot se omiten si la extracción "
+                     "por coordenadas cuadra 100% con el pie del PDF.")
 
         uploaded_file = st.file_uploader(
             "📂 Selecciona el PDF",
@@ -2308,10 +3107,15 @@ def main():
 
         if uploaded_file:
             extractor = CamelotExtractorPro()
-            results = run_extraction_cached(uploaded_file, extractor)
+            results = run_extraction_cached(uploaded_file, extractor, run_all=run_all_methods)
 
             st.header("📊 Resultados de Extracción")
-            method_names = list(results.keys())
+            method_names = [name for name, res in results.items() if not res.get('skipped')]
+            skipped_names = [name for name, res in results.items() if res.get('skipped')]
+            if skipped_names:
+                st.caption("⚡ Métodos de respaldo omitidos porque la extracción por coordenadas cuadró "
+                           "100% con el pie del PDF (activa «Comparar con todos los métodos» para verlos): "
+                           + ', '.join(skipped_names))
 
             if method_names:
                 tabs = st.tabs(method_names)
@@ -2363,10 +3167,7 @@ def main():
                     st.session_state['extracted_data'] = best_data
 
                     render_footer_validation(best_data)
-                    integrity_issues = validate_tablets_integrity(best_data)
-                    if integrity_issues:
-                        st.warning(f"⚠️ {len(integrity_issues)} discrepancias de integridad entre "
-                                   f"códigos de tablillas y totales (ver pestaña Dashboard de Tablillas)")
+                    render_data_quality_panel(best_data)
 
                     st.subheader("💾 Exportar Datos")
                     col1, col2 = st.columns(2)
@@ -2386,11 +3187,17 @@ def main():
 
                     with col2:
                         try:
-                            excel_buffer = export_to_professional_excel(best_data)
-                            if excel_buffer:
+                            export_key = (st.session_state.get('extraction_key'), best_method)
+                            cached_export = st.session_state.get('excel_export')
+                            if not cached_export or cached_export['key'] != export_key:
+                                excel_buffer = export_to_professional_excel(best_data)
+                                cached_export = {'key': export_key,
+                                                 'bytes': excel_buffer.getvalue() if excel_buffer else None}
+                                st.session_state['excel_export'] = cached_export
+                            if cached_export['bytes']:
                                 st.download_button(
                                     "📊 Descargar Excel Profesional",
-                                    excel_buffer.getvalue(),
+                                    cached_export['bytes'],
                                     f"analisis_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                     help="Excel con múltiples hojas de análisis"
@@ -2425,6 +3232,15 @@ def main():
             st.info("💡 Primero extrae datos del PDF en la pestaña 'Extracción PDF'")
 
     with main_tabs[3]:
+        if has_data:
+            if filtered_data.empty:
+                st.warning("No hay albaranes que coincidan con los filtros seleccionados")
+            else:
+                create_tablet_control_tab(filtered_data, full_df=extracted_data)
+        else:
+            st.info("💡 Primero extrae datos del PDF en la pestaña 'Extracción PDF'")
+
+    with main_tabs[4]:
         create_historical_dashboard()
 
 

@@ -6,6 +6,16 @@ Extractor profesional de PDFs con Camelot - Sistema completo de análisis de alb
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 ![Status](https://img.shields.io/badge/status-production-green.svg)
 
+## 🆕 v3.2 - Extracción por coordenadas y control de tablillas
+
+- **Extracción por coordenadas exactas** (`method_coordinate_precision`, pdfplumber): lee las 18 columnas de la geometría real de cada página (A4 o Letter, cualquier cantidad de hojas). Los métodos de Camelot quedan como respaldo y solo se ejecutan si la extracción no cuadra (opción "Comparar con todos los métodos" para forzarlos).
+- **Verificación automática**: cuadratura contra el pie del PDF, integridad de tablillas por albarán, filas vs albaranes presentes en el texto del PDF y texto sin asignar (panel "Calidad de la Extracción").
+- **Pestaña Control de Tablillas**: buscador (albarán, tablilla, cliente/obra), lista de acción por demora, antigüedad de tablillas abiertas y detalle una fila por tablilla.
+- **Filtros globales** (Subsidiary, Warehouse, Cost Center, Definitive) que afectan tablas y dashboards.
+- **Excel**: hojas `Datos_Principales` (18 columnas, base del análisis histórico), `Por_Cost_Center`, `Lista_Accion`, `Detalle_Tablillas` y `Calidad_Datos`.
+- **Análisis histórico**: comparación entre dos archivos (albaranes y tablillas cerradas, nuevas y que siguen pendientes).
+- `requirements.txt` fija `pyarrow==16.1.0` por compatibilidad con `numpy==1.26.4`.
+
 ## 🆕 Nueva Actualización v3.1 - Corrección Crítica para Cierre de Mes
 
 ### ✅ Problema Solucionado: Columna "Open Tablets" Vacía
