@@ -89,11 +89,11 @@ CAMELOT_STREAM_COLUMNS = [
 
 SLIP_PATTERN = re.compile(r'^7290000\d{5}$')
 SLIP_SEARCH_PATTERN = re.compile(r'7290000\d{5}')
-HEADER_OFFSET = 497          # respaldo: el encabezado termina en page.height - 497
+REFERENCE_PAGE_WIDTH = 841.92004  # ancho de página (A4 horizontal) en el que se midieron COL_BOUNDS
+HEADER_OFFSET = 497          # respaldo: el encabezado termina en page.height - 497 (a escala 1.0)
 HEADER_LINE_RANGE = (40.0, 200.0)  # rango de 'top' donde buscar la línea bajo el encabezado
 ROW_TOP_MARGIN = 2.5         # margen superior de la ventana vertical de cada fila
-ROW_HEIGHT = 11.0            # alto base de una fila de 2 líneas
-ROW_MAX_HEIGHT = 18.0        # alto máximo si la fila ocupa 3 líneas
+ROW_MAX_HEIGHT = 18.0        # alto máximo de una fila (hasta 3 líneas)
 ROW_LINE_GAP = 10.0          # separación máxima entre líneas consecutivas de una misma fila
 MULTILINE_COLS = (8, 9, 10, 12, 14)  # Customer, Job_Name, Definitive, Tablets, Open_Tablets
 CRITICAL_DELAY_DAYS = 20     # Counting_Delay >= 20 días => albarán crítico
@@ -680,34 +680,73 @@ class CamelotExtractorPro:
     # ========================================================================
 
     @staticmethod
-    def _column_index_for_x(x_center: float) -> int:
+    def _column_index_for_x(x_center: float, bounds: List[Tuple[float, float]] = COL_BOUNDS) -> int:
         """Columna 0..17 que contiene la coordenada X dada (con saturación en los extremos)."""
-        if x_center < COL_BOUNDS[0][0]:
+        if x_center < bounds[0][0]:
             return 0
-        for idx, (x_start, x_end) in enumerate(COL_BOUNDS):
+        for idx, (x_start, x_end) in enumerate(bounds):
             if x_start <= x_center < x_end:
                 return idx
-        return len(COL_BOUNDS) - 1
+        return len(bounds) - 1
 
     @staticmethod
-    def _detect_header_limit(page) -> float:
+    def _get_page_geometry(page) -> Dict:
         """
-        'top' de la línea horizontal bajo el encabezado de la tabla.
+        Geometría real de la página: escala, 'top' de la línea bajo el encabezado y
+        fronteras X de las 18 columnas.
 
-        El encabezado cambia de alto entre la primera página y las siguientes,
-        por lo que se lee la geometría real de la página; si no hay líneas se usa
-        el valor fijo page.height - 497.
+        El reporte llega con distintos tamaños de página (A4 842 pt, Letter 792 pt)
+        y el encabezado cambia de alto entre la primera página y las siguientes.
+        Las 18 columnas se leen de los segmentos horizontales del encabezado; si
+        no se encuentran, se escalan COL_BOUNDS según el ancho de la página.
         """
+        scale = page.width / REFERENCE_PAGE_WIDTH
+        scaled_bounds = [(x0 * scale, x1 * scale) for x0, x1 in COL_BOUNDS]
+        geometry = {
+            'scale': scale,
+            'header_limit': page.height - HEADER_OFFSET * scale,
+            'bounds': scaled_bounds,
+        }
+
         try:
-            low, high = HEADER_LINE_RANGE
-            tops = [ln['top'] for ln in page.lines
-                    if abs(ln['bottom'] - ln['top']) < 1.0 and ln['x0'] < COL_BOUNDS[1][0]
-                    and low <= ln['top'] <= high]
-            if tops:
-                return max(tops)
+            low, high = HEADER_LINE_RANGE[0] * scale, HEADER_LINE_RANGE[1] * scale
+            groups: Dict[float, List[Dict]] = {}
+            for ln in page.lines:
+                if (abs(ln['bottom'] - ln['top']) < 1.0 and low <= ln['top'] <= high
+                        and (ln['x1'] - ln['x0']) < 200 * scale):
+                    groups.setdefault(round(ln['top'], 0), []).append(ln)
+
+            if not groups:
+                # Sin segmentos por columna: usar cualquier línea horizontal que parta en la col 0.
+                tops = [ln['top'] for ln in page.lines
+                        if abs(ln['bottom'] - ln['top']) < 1.0 and low <= ln['top'] <= high
+                        and ln['x0'] < scaled_bounds[1][0]]
+                if tops:
+                    geometry['header_limit'] = max(tops)
+
+            if groups:
+                header_lines = max(groups.values(), key=len)
+                geometry['header_limit'] = max(ln['top'] for ln in header_lines)
+
+                segments = sorted({(round(ln['x0'], 2), round(ln['x1'], 2)) for ln in header_lines})
+                contiguous = all(abs(segments[i][1] - segments[i + 1][0]) <= 1.0
+                                 for i in range(len(segments) - 1))
+                if len(segments) == len(COL_BOUNDS) and contiguous:
+                    geometry['bounds'] = segments
         except Exception:
             pass
-        return page.height - HEADER_OFFSET
+
+        return geometry
+
+    @staticmethod
+    def _stream_columns_for(pdf_path: str) -> List[str]:
+        """Separadores X de Camelot stream, medidos en la primera página del PDF."""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                bounds = CamelotExtractorPro._get_page_geometry(pdf.pages[0])['bounds']
+            return [','.join(f'{x0:.2f}' for x0, _ in bounds[1:])]
+        except Exception:
+            return CAMELOT_STREAM_COLUMNS
 
     @staticmethod
     def _cluster_lines(words: List[Dict], tolerance: float = 3.0) -> List[List[Dict]]:
@@ -721,34 +760,37 @@ class CamelotExtractorPro:
         return lines
 
     def _collect_row_words(self, body_words: List[Dict], sy: float,
-                           next_sy: Optional[float]) -> List[List[Dict]]:
+                           next_sy: Optional[float], geometry: Dict) -> List[List[Dict]]:
         """
         Líneas visuales que pertenecen a la fila del albarán que empieza en sy.
 
-        - Ventana base: [sy - 2.5, sy + 11.0] (2 líneas), siempre acotada por la
-          fila siguiente (next_sy - 2.5).
-        - Si la fila ocupa 3 líneas, la ventana se extiende hasta sy + 18.0 solo
-          mientras las líneas sean contiguas (<= 10 pt entre sí) y contengan
-          únicamente columnas multilínea; así no se absorbe la fila de totales
-          del pie (cols 13 y 15) ni texto ajeno a la fila.
+        La ventana parte en sy - 2.5 y llega como máximo a sy + 18.0 (3 líneas),
+        siempre acotada por la fila siguiente (next_sy - 2.5). Cada línea
+        adicional se acepta solo si es contigua (<= 10 pt de la anterior) y
+        contiene únicamente columnas multilínea (Customer, Job_Name, Definitive,
+        Tablets, Open_Tablets); así no se absorbe la fila de totales del pie
+        (cols 13 y 15) ni texto ajeno a la fila. Las distancias se escalan con
+        el tamaño de la página.
         """
-        window_bottom = sy + ROW_MAX_HEIGHT
-        if next_sy is not None:
-            window_bottom = min(window_bottom, next_sy - ROW_TOP_MARGIN)
+        scale, bounds = geometry['scale'], geometry['bounds']
+        margin = ROW_TOP_MARGIN * scale
 
-        candidates = [w for w in body_words if sy - ROW_TOP_MARGIN <= w['top'] <= window_bottom]
+        window_bottom = sy + ROW_MAX_HEIGHT * scale
+        if next_sy is not None:
+            window_bottom = min(window_bottom, next_sy - margin)
+
+        candidates = [w for w in body_words if sy - margin <= w['top'] <= window_bottom]
         accepted: List[List[Dict]] = []
 
-        for line in self._cluster_lines(candidates):
-            line_top = min(w['top'] for w in line)
+        for line in self._cluster_lines(candidates, tolerance=3.0 * scale):
             if accepted:
+                line_top = min(w['top'] for w in line)
                 previous_top = min(w['top'] for w in accepted[-1])
-                if line_top - previous_top > ROW_LINE_GAP:
+                if line_top - previous_top > ROW_LINE_GAP * scale:
                     break
-                if line_top - sy > ROW_HEIGHT:
-                    columns = {self._column_index_for_x((w['x0'] + w['x1']) / 2) for w in line}
-                    if not columns.issubset(MULTILINE_COLS):
-                        break
+                columns = {self._column_index_for_x((w['x0'] + w['x1']) / 2, bounds) for w in line}
+                if not columns.issubset(MULTILINE_COLS):
+                    break
             accepted.append(line)
 
         return accepted
@@ -765,15 +807,17 @@ class CamelotExtractorPro:
         """
         words = page.extract_words(x_tolerance=2.5, y_tolerance=1.5, keep_blank_chars=False)
 
-        header_limit = self._detect_header_limit(page)
+        geometry = self._get_page_geometry(page)
+        bounds = geometry['bounds']
+        header_limit = geometry['header_limit']
         body_words = [w for w in words if w['top'] >= header_limit]
 
+        def col_of(word):
+            return self._column_index_for_x((word['x0'] + word['x1']) / 2, bounds)
+
         def find_slip_tops(candidates):
-            return sorted(
-                w['top'] for w in candidates
-                if self._column_index_for_x((w['x0'] + w['x1']) / 2) == 2
-                and SLIP_PATTERN.match(w['text'])
-            )
+            return sorted(w['top'] for w in candidates
+                          if col_of(w) == 2 and SLIP_PATTERN.match(w['text']))
 
         slip_tops = find_slip_tops(body_words)
         if not slip_tops:
@@ -787,12 +831,11 @@ class CamelotExtractorPro:
         for i, sy in enumerate(slip_tops):
             next_sy = slip_tops[i + 1] if i + 1 < len(slip_tops) else None
 
-            cells = [[] for _ in COL_BOUNDS]
-            for line_idx, line in enumerate(self._collect_row_words(body_words, sy, next_sy)):
+            cells = [[] for _ in bounds]
+            for line_idx, line in enumerate(self._collect_row_words(body_words, sy, next_sy, geometry)):
                 for w in line:
                     assigned_ids.add(id(w))
-                    col_idx = self._column_index_for_x((w['x0'] + w['x1']) / 2)
-                    cells[col_idx].append((line_idx, w['x0'], w['text']))
+                    cells[col_of(w)].append((line_idx, w['x0'], w['text']))
 
             row = []
             for col_idx, parts in enumerate(cells):
@@ -805,11 +848,11 @@ class CamelotExtractorPro:
         if is_last_page:
             last_sy = slip_tops[-1] if slip_tops else header_limit
             leftovers = [w for w in body_words if w['top'] > last_sy and id(w) not in assigned_ids]
-            footer = self._detect_footer_totals(leftovers)
+            footer = self._detect_footer_totals(leftovers, bounds)
 
         return rows, footer
 
-    def _detect_footer_totals(self, words: List[Dict]) -> Optional[Dict]:
+    def _detect_footer_totals(self, words: List[Dict], bounds: List[Tuple[float, float]] = COL_BOUNDS) -> Optional[Dict]:
         """Fila de totales globales del PDF (cols 13 y 15) entre las palabras no asignadas a filas."""
         candidates = sorted(words, key=lambda w: w['top'])
 
@@ -825,7 +868,7 @@ class CamelotExtractorPro:
             for w in line:
                 if not re.fullmatch(r'\d+', w['text']):
                     continue
-                col_idx = self._column_index_for_x((w['x0'] + w['x1']) / 2)
+                col_idx = self._column_index_for_x((w['x0'] + w['x1']) / 2, bounds)
                 if col_idx == 13 and col_13 is None:
                     col_13 = int(w['text'])
                 elif col_idx == 15 and col_15 is None:
@@ -868,7 +911,7 @@ class CamelotExtractorPro:
         """Camelot stream con las fronteras X exactas de las 18 columnas."""
         try:
             return camelot.read_pdf(pdf_path, pages='all', flavor='stream',
-                                   columns=CAMELOT_STREAM_COLUMNS, **kwargs)
+                                   columns=self._stream_columns_for(pdf_path), **kwargs)
         except Exception:
             return camelot.read_pdf(pdf_path, pages='all', flavor='stream', **kwargs)
 
@@ -2273,7 +2316,7 @@ def main():
             if method_names:
                 tabs = st.tabs(method_names)
                 best_method = None
-                best_score = 0
+                best_score = float('-inf')
 
                 for tab, method_name in zip(tabs, method_names):
                     with tab:
@@ -2296,10 +2339,13 @@ def main():
                                     score += 10
                                 if validation['has_slip_numbers']:
                                     score += 10
+                                footer_check = check_pdf_footer_totals(result['data'])
+                                if footer_check and footer_check['match']:
+                                    score += 50000  # cuadra exacto con el pie del PDF
+                                score -= 100 * len(validate_tablets_integrity(result['data']))
                                 if method_name == 'method_coordinate_precision':
-                                    # Geometría exacta: gana sobre los respaldos de Camelot
-                                    # (hybrid puede duplicar filas y sumar más puntaje).
-                                    score += 100000
+                                    # Desempata a favor de la geometría exacta frente a Camelot.
+                                    score += 10000
 
                                 if score > best_score:
                                     best_score = score
@@ -2317,6 +2363,10 @@ def main():
                     st.session_state['extracted_data'] = best_data
 
                     render_footer_validation(best_data)
+                    integrity_issues = validate_tablets_integrity(best_data)
+                    if integrity_issues:
+                        st.warning(f"⚠️ {len(integrity_issues)} discrepancias de integridad entre "
+                                   f"códigos de tablillas y totales (ver pestaña Dashboard de Tablillas)")
 
                     st.subheader("💾 Exportar Datos")
                     col1, col2 = st.columns(2)
